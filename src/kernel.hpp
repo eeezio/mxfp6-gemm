@@ -55,7 +55,7 @@ __device__ __forceinline__ void issue_A_chunks(uint32_t lds_base, int row_stride
 
 // DRIP-A kernel (A staged deep-K in LDS + B-direct coalesced ring): A's cooperative
 // buffer_loads for the NEXT tile are dripped across THIS tile's MFMA quartets instead of
-// bursted. HARD_WAIT=true puts wait_vmcnt(0) before each DB barrier (hard RAW guarantee for
+// bursted. HARD_WAIT=true puts wait_vmcnt(0) before each double-buffer barrier (hard RAW guarantee for
 // the dripped A; cheap because A is issued early).
 // A-drip schedule knob (LINEAR): which MFMA quartet issues which A chunks.
 //   ADRIP_START : first quartet that issues A chunks (skip the sub-head-stall quartets)
@@ -71,7 +71,7 @@ __device__ __forceinline__ void issue_A_chunks(uint32_t lds_base, int row_stride
 //   STRIDE=1, PER=1, STOP=NB. ADRIP_START=0 reproduces the original front-loaded schedule;
 //   batching (PER>=2) was swept and lost. swz0 stays best for drip-A (swz32 did not help).
 template <int M_TILE, int N_TILE, int K_TILE, int WAVES_M, int WAVES_N, int MIN_OCC = 1,
-          int SWZ = 0, bool DB = true, typename OutT = float, int PFD = 5, bool HARD_WAIT = true,
+          int SWZ = 0, typename OutT = float, int PFD = 5, bool HARD_WAIT = true,
           int ADRIP_START = 1, int ADRIP_STRIDE = 1, int ADRIP_PER = 1, int ADRIP_STOP = 0>
 __global__ void __launch_bounds__(256, MIN_OCC)
     lds_gemm_hybrid_dripA(const void* __restrict__ A, const void* __restrict__ B,

@@ -31,12 +31,12 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
         // of always benchmarking occ1 first on a still-ramping GPU. Kept at occ1.)
         dim3 g(M / 128, N / 256);
         int lds = 2 * (128 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, true, OutT>
+        lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes);
     } else {
         dim3 g(M / 256, N / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, 0, true, OutT>
+        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, 0, OutT>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes);
     }
 }
