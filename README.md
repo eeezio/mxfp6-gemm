@@ -208,6 +208,69 @@ gives a safe scale tail automatically). Same result, but A is padded per-row.
 
 ---
 
+## Tuning — kernel template parameters
+
+The public API (`gemm.hpp`) is device-free and exposes **no** tuning knobs; the only shape-level
+decision it makes is the tile, via `choose_tile`. The performance-relevant knobs live on the
+internal kernel template `lds_gemm_hybrid_dripA` (`src/kernel.hpp`), launched from
+`src/dispatch.hpp`. To experiment, edit the template arguments at the two `dispatch.hpp` call
+sites (and re-thread the scale grouping — see *coupling* below). The defaults below are the
+**measured optima** on gfx950; the rationale for the main design choices is in
+[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md), and the per-knob tuning notes (what was
+measured, what lost) live in the `src/kernel.hpp` comments.
+
+```cpp
+template <int M_TILE, int N_TILE, int K_TILE, int WAVES_M, int WAVES_N, int MIN_OCC = 1,
+          int SWZ = 0, typename OutT = float, int PFD = 5, bool HARD_WAIT = true,
+          int ADRIP_START = 1, int ADRIP_STRIDE = 1, int ADRIP_PER = 1, int ADRIP_STOP = 0>
+```
+
+| Param | Default | Meaning |
+|---|---|---|
+| `M_TILE` × `N_TILE` | 256×256 / 128×256 | Register accumulator tile per workgroup. Larger ⇒ higher arithmetic intensity (AI) but fewer workgroups. The live shape knob (`choose_tile`): 256×256 for CU-filling shapes, 128×256 for WG-starved small-M. |
+| `K_TILE` | 192 | Deep-K tile depth = size of the MFMA window backing one load. Bigger window hides load latency. `subs = K_TILE/64`. |
+| `WAVES_M` × `WAVES_N` | 2×2 | How the tile is split across the block's 4 waves → per-wave block shape `MPW×NPW` = `(M_TILE/32/WAVES_M)×(N_TILE/32/WAVES_N)`. Sets the load-vs-MFMA ratio (perimeter vs area) and input VGPR. |
+| `MIN_OCC` | 1 | Occupancy floor (`__launch_bounds__` 2nd arg). occ1 holds the largest tile; occ2 forces a smaller AI (see coupling). |
+| `SWZ` | 0 | Workgroup-ID swizzle width for L2 locality (`0` = off). Functional but currently always `0` from the dispatcher (swz0 is best on this machine). |
+| `OutT` | — | Output element type (`float` / `__half` / `__hip_bfloat16`), set by `gemm()`. |
+| `PFD` | 5 | Depth of B's compile-time register prefetch ring = B tiles in flight. Costs VGPR; `5` is the deepest that keeps spill = 0 at 16-acc. |
+| `HARD_WAIT` | true | Insert `wait_vmcnt(0)` before each double-buffer barrier — a hard RAW guard for the dripped (compiler-invisible) A loads. **`false` is a footgun** (risks a RAW race); leave it `true`. |
+| `ADRIP_START` | 1 | First MFMA quartet that issues A chunks (skip the sub-head stall quartet). |
+| `ADRIP_STRIDE` | 1 | Quartets between successive issuing quartets (`1` = consecutive). |
+| `ADRIP_PER` | 1 | A chunks issued per issuing quartet (`≥2` finishes A earlier ⇒ more RAW margin but more issue backpressure — measured net loss). |
+| `ADRIP_STOP` | 0 | Last quartet (exclusive) allowed to issue A; `≤0` ⇒ run to the end of the tile. |
+
+### Coupling — what must move together
+
+These knobs are not independent. Four clusters share the same hardware budgets, and changing one
+member forces re-balancing the rest:
+
+- **A — register budget** `{M_TILE, N_TILE, WAVES_M, WAVES_N, MIN_OCC, PFD}`. All draw from the
+  merged 512-VGPR pool (gfx950 fuses arch + acc; occupancy gate = total ≤ `512/MIN_OCC`). Per-wave
+  accumulators `MPW×NPW` consume AGPR (16 acc = 256 AGPR); the `PFD` ring + operands + addresses
+  consume arch VGPR. Because 16 acc alone is the *entire* occ2 budget, you cannot raise `MIN_OCC`
+  without shrinking the tile or adding waves (i.e. cutting AI). Change any one ⇒ re-check spill = 0.
+- **B — deep-K / LDS / scale** `{K_TILE, M_TILE}`. LDS use = `2 × M_TILE × (K_TILE·6/8)` must fit
+  160 KB. And `subs = K_TILE/64` is the scale load width, capped at `dwordx4` ⇒ **`K_TILE ≤ 256`**.
+- **C — host↔device layout (correctness, not just perf)**. `MPW`/`NPW` (derived from the tile and
+  wave counts) **must** be passed to the host `tile_scale` (`MPW` for A, `NPW` for B), and `K_TILE`
+  must match `tile_scale`'s `subs` and `kpad`. The kernel also asserts `MPW ≤ 4 && NPW ≤ 4`
+  (`NDA==1 && NDB==1`). Get this wrong and the output is silently incorrect — so any change to
+  cluster A/B that moves `MPW`/`NPW`/`K_TILE` requires the matching host change.
+- **D — drip schedule** `{ADRIP_START, ADRIP_STRIDE, ADRIP_PER, ADRIP_STOP}`. The schedule must fit
+  `ISSUES_A` (≈ `M_TILE·ROW_CHUNKS/256`) A-load chunks into the available compute quartets
+  `NB = (K_TILE/64)·N_PW`: `(STOP−START)/STRIDE × PER ≥ ISSUES_A`. Changing `M_TILE`, `N_TILE`,
+  `WAVES_*`, or `K_TILE` changes `NB`/`ISSUES_A`, so the drip schedule must be re-checked.
+
+`SWZ` and `HARD_WAIT` are effectively standalone (`SWZ` couples only to shape/L2; `HARD_WAIT` is a
+correctness guard whose only safe value is `true`).
+
+> The shipped defaults have been swept to their optimum and the kernel is occ1 latency-bound — in
+> practice there is little headroom left in these knobs alone. See `docs/OPTIMIZATIONS.md` for the
+> measured ceilings and the dead ends already ruled out.
+
+---
+
 ## Testing
 
 `ctest` (i.e. `test_gemm`) is the correctness gate: fresh-allocated, `0x5A`-poisoned outputs
