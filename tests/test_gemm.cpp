@@ -92,10 +92,14 @@ static bool verify(int M, int N, int K) {
     float* dD;
     hipMalloc(&dD, (size_t)M * N * 4);
     hipMemset(dD, 0x5A, (size_t)M * N * 4);
-    gemm(OutType::F32, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br);
+    void* ws = nullptr;
+    size_t wsb = gemm_workspace_size(M, N, x.Kp);
+    if (wsb) hipMalloc(&ws, wsb);
+    gemm(OutType::F32, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb);
     hipDeviceSynchronize();
     std::vector<float> Dg((size_t)M * N);
     hipMemcpy(Dg.data(), dD, (size_t)M * N * 4, hipMemcpyDeviceToHost);
+    if (ws) hipFree(ws);
     hipFree(dD);
     float er = 0, mx = 0;
     for (size_t i = 0; i < (size_t)M * N; i++) {
@@ -152,10 +156,15 @@ static bool verify_compact(int M, int N, int K) {
     float* dD;
     hipMalloc(&dD, (size_t)M * N * 4);
     hipMemset(dD, 0x5A, (size_t)M * N * 4);
-    gemm(OutType::F32, M, N, Kp, dA, dBsh, dsA, dsB, dD, Aq.packed_row_bytes, Bq.packed_row_bytes);
+    void* ws = nullptr;
+    size_t wsb = gemm_workspace_size(M, N, Kp);
+    if (wsb) hipMalloc(&ws, wsb);
+    gemm(OutType::F32, M, N, Kp, dA, dBsh, dsA, dsB, dD, Aq.packed_row_bytes, Bq.packed_row_bytes,
+         ws, wsb);
     hipDeviceSynchronize();
     std::vector<float> Dg((size_t)M * N);
     hipMemcpy(Dg.data(), dD, (size_t)M * N * 4, hipMemcpyDeviceToHost);
+    if (ws) hipFree(ws);
     float er = 0, mx = 0;
     size_t nans = 0;
     for (size_t i = 0; i < (size_t)M * N; i++) {
@@ -178,19 +187,20 @@ static void perf(int M, int N, int K) {
     Dev x = setup(M, N, K, tc);
     __half* dD;
     hipMalloc(&dD, (size_t)M * N * 2);
-    auto run = [&] { gemm(OutType::F16, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br); };
+    // Allocate split-K workspace once and reuse across the bench loop (the intended usage).
+    void* ws = nullptr;
+    size_t wsb = gemm_workspace_size(M, N, x.Kp);
+    if (wsb) hipMalloc(&ws, wsb);
+    auto run = [&] {
+        gemm(OutType::F16, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb);
+    };
     double ms = bench(run);
-    // mirror dispatch's split decision for reporting only (CU=256, MIN_TILES_PER_SEG=8)
-    int k_tiles = x.Kp / KT, base_wg = (M / tc.MT) * (N / 256), S = 1;
-    if (base_wg < 256 && k_tiles >= 16) {
-        S = (256 + base_wg - 1) / base_wg;
-        int cap = k_tiles / 8;
-        if (S > cap) S = cap;
-        while (S > 1 && (k_tiles % S) != 0) S--;
-    }
+    int base_wg = (M / tc.MT) * (N / 256);
+    int S = wsb ? (int)(wsb / ((size_t)M * N * sizeof(float))) : 1;  // S from workspace size
     int wg = base_wg * S;
     printf("  %5dx%5dx%5d wg=%4d S=%d -> %3dx%3d : %.0f TFLOPs\n", M, N, K, wg, S, tc.MT, tc.NT,
            tf(M, N, K, ms));
+    if (ws) hipFree(ws);
     hipFree(dD);
     teardown(x);
 }

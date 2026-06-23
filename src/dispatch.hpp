@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <cstdio>
 // INTERNAL: templated GEMM launch for the unified hybrid drip-A kernel. The public,
 // type-erased entry points (mxfp6::gemm / mxfp6::choose_tile) live in mxfp6/gemm.hpp and
 // are defined in src/gemm.cpp, which instantiates this template for F32/F16/BF16.
@@ -14,35 +15,16 @@
 namespace mxfp6 {
 namespace detail {
 
-// Split-K partial-sum workspace, cached across calls. A per-call hipMalloc/hipFree of the
-// S*M*N FP32 buffer costs ~1.3 ms (both calls device-synchronize) — ~14x the entire tier-1
-// GEMM, which would make split-K a net loss in any repeated-call workload. So we keep one
-// grow-on-demand buffer for the process lifetime instead. Single-stream library (matches the
-// no-locking convention here); the OS reclaims the buffer at exit.
-inline float* splitk_workspace(size_t bytes) {
-    static float* ptr = nullptr;
-    static size_t cap = 0;
-    if (bytes > cap) {
-        if (ptr) hipFree(ptr);
-        hipMalloc(&ptr, bytes);
-        cap = bytes;
-    }
-    return ptr;
-}
-
-// Kp = K padded to a multiple of K_TILE(=192). Caller must have tiled the scales with
-// choose_tile(...).MPW/NPW and preshuffled B (preshuffle_B).
-template <typename OutT>
-inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh,
-                          const uint8_t* dsA, const uint8_t* dsB, OutT* dD, int A_row_bytes,
-                          int B_row_bytes) {
+// Split factor S for (M,N,Kp): the number of K-segments to split across independent workgroups
+// for a WG-starved shape (S==1 means "do not split"). SINGLE SOURCE OF TRUTH — both the public
+// gemm_workspace_size() query and dispatch_gemm() call this so the workspace a caller sizes always
+// matches the workspace dispatch will use.
+inline int splitk_S(int M, int N, int Kp) {
     constexpr int KT = K_TILE;
     constexpr int CU = 256;                 // MI350X (gfx950)
     constexpr int MIN_TILES_PER_SEG = 8;    // min deep tiles per segment (amortize prologue + small-K gate)
     TileChoice tc = choose_tile(M, N);
-    dim3 blk(256);
-    int kit = Kp / 64;
-    int k_tiles = kit / (KT / 64);          // total deep tiles for full K = Kp/192
+    int k_tiles = (Kp / 64) / (KT / 64);    // total deep tiles for full K = Kp/192
     int base_wg = (M / tc.MT) * (N / 256);
     int S = 1;
     if (base_wg < CU && k_tiles >= 2 * MIN_TILES_PER_SEG) {
@@ -52,10 +34,46 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
         if (S < 1) S = 1;
         while (S > 1 && (k_tiles % S) != 0) S--;       // divisibility: equal-length segments, kernel uses blockIdx.z
     }
+    return S;
+}
+
+// Bytes of split-K partial-sum workspace dispatch_gemm would use for (M,N,Kp). 0 if no split.
+inline size_t splitk_workspace_bytes(int M, int N, int Kp) {
+    int S = splitk_S(M, N, Kp);
+    return S > 1 ? (size_t)S * (size_t)M * N * sizeof(float) : 0;
+}
+
+// Kp = K padded to a multiple of K_TILE(=192). Caller must have tiled the scales with
+// choose_tile(...).MPW/NPW and preshuffled B (preshuffle_B).
+// ws/ws_bytes: caller-provided split-K workspace (see gemm_workspace_size). If a WG-starved shape
+// would split but ws is null or too small, split is skipped (the result is still correct, just
+// without the speedup) and a warning is logged to stderr.
+template <typename OutT>
+inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh,
+                          const uint8_t* dsA, const uint8_t* dsB, OutT* dD, int A_row_bytes,
+                          int B_row_bytes, void* ws, size_t ws_bytes) {
+    constexpr int KT = K_TILE;
+    dim3 blk(256);
+    int kit = Kp / 64;
+    int k_tiles = kit / (KT / 64);          // total deep tiles for full K = Kp/192
+    TileChoice tc = choose_tile(M, N);
+    int S = splitk_S(M, N, Kp);
     if (S > 1) {
-        int seg_tiles = k_tiles / S;                  // exact (Step 1 guaranteed divisibility)
+        size_t need = (size_t)S * (size_t)M * N * sizeof(float);
+        if (!ws || ws_bytes < need) {
+            // Caller wanted a WG-starved shape split but gave no/insufficient workspace. Fall back
+            // to the single-kernel path (correct, just slower) and warn so the miss is visible.
+            fprintf(stderr,
+                    "[mxfp6] split-K skipped for %dx%dx%d: workspace %zu bytes, need %zu — "
+                    "running unsplit (slower). Size it with gemm_workspace_size().\n",
+                    M, N, Kp, ws_bytes, need);
+            S = 1;
+        }
+    }
+    if (S > 1) {
+        int seg_tiles = k_tiles / S;                  // exact (splitk_S guarantees divisibility)
         size_t total = (size_t)M * N;
-        float* Dpart = splitk_workspace((size_t)S * total * sizeof(float));
+        float* Dpart = static_cast<float*>(ws);
         if (tc.MT == 128) {
             dim3 g(M / 128, N / 256, S);
             int lds = 2 * (128 * (KT * 6 / 8));

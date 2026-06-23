@@ -27,6 +27,23 @@ FP16 output, K=8192, on MI350X (gfx950), ROCm 7.0.2.1. Same-precision MXFP6 perf
 
 Absolute numbers vary run-to-run; the **ratio** is the stable takeaway.
 
+### Narrow-N / large-K shapes (split-K)
+
+Shapes with a small N and a large K launch too few workgroups to fill the machine — e.g.
+`M=2048, N=1024` on the 128×256 path is only `(2048/128)·(1024/256) = 64` workgroups for 256 CUs
+(25 % occupancy). For these the library automatically splits the K dimension across independent
+workgroups (**split-K**, see [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) §8). FP16, MI350X:
+
+| M × N × K | without split-K | with split-K (S) | speedup |
+|---|---:|---:|---:|
+| 2048 × 1024 × 12288 | 555 | **1180** (S=4) | **2.13×** |
+| 2048 × 1024 × 16128 | 569 | **1326** (S=4) | **2.33×** |
+| 2048 × 6144 × 16128 | 1588 | 1588 (no split) | — |
+
+Split-K is enabled inside `gemm()` for workgroup-starved shapes when you supply a scratch buffer
+(sized via `gemm_workspace_size`, see below); shapes that already fill the CUs (e.g. wide N) skip it
+and need no workspace.
+
 ---
 
 ## Build
@@ -105,11 +122,18 @@ hipMalloc(&dsA,  sA.data.size());            hipMemcpy(dsA,  sA.data.data(),  sA
 hipMalloc(&dsB,  sB.data.size());            hipMemcpy(dsB,  sB.data.data(),  sB.data.size(),  ...);
 hipMalloc(&dD,   (size_t)M * N * sizeof(OutElem));   // OutElem = float / __half / __hip_bfloat16
 
+// Split-K scratch: 0 for most shapes; non-zero for WG-starved narrow-N/large-K. Allocate once and
+// reuse across calls (don't malloc/free per call). Pass (nullptr,0) to never split.
+void* ws = nullptr;
+size_t ws_bytes = gemm_workspace_size(M, N, Kp);
+if (ws_bytes) hipMalloc(&ws, ws_bytes);
+
 // --- 4. launch ---
 gemm(OutType::F16, M, N, Kp,
      dA, dBsh, dsA, dsB, dD,
      Aq.packed_row_bytes,        // A_row_bytes = packed(K)  (compact stride)
-     Bq.packed_row_bytes);       // B_row_bytes = packed(Kp)
+     Bq.packed_row_bytes,        // B_row_bytes = packed(Kp)
+     ws, ws_bytes);              // split-K workspace (nullptr,0 = never split)
 hipDeviceSynchronize();
 ```
 
@@ -129,7 +153,8 @@ per-row — only `a_compact_end_pad(K)` bytes are added at the very end of the w
 | `int kpad(int K)` | K rounded up to a multiple of `K_TILE` → pass as the kernel's `Kp`. |
 | `struct TileChoice { int MT, NT, MPW, NPW; }` | Tile (MT×NT) + per-wave 32-block counts (MPW/NPW) for scale grouping. |
 | `TileChoice choose_tile(int M, int N)` | Pick the tile/scale grouping for a shape. **Use its `MPW`/`NPW` for `tile_scale`.** |
-| `void gemm(OutType, M, N, Kp, dA, dBsh, dsA, dsB, dD, A_row_bytes, B_row_bytes)` | Launch. All `d*` are device pointers. |
+| `size_t gemm_workspace_size(int M, int N, int Kp)` | Bytes of split-K scratch to allocate for this shape; **0** if it doesn't split. |
+| `void gemm(OutType, M, N, Kp, dA, dBsh, dsA, dsB, dD, A_row_bytes, B_row_bytes, ws, ws_bytes)` | Launch. All `d*`/`ws` are device pointers. `ws`/`ws_bytes` = split-K scratch (`gemm_workspace_size`); `(nullptr,0)` never splits. |
 
 ### `mxfp6/preprocess.hpp` (host)
 
@@ -204,6 +229,14 @@ gives a safe scale tail automatically). Same result, but A is padded per-row.
 - **Inputs are device buffers.** `gemm()` only launches the kernel; you allocate, quantize on the
   host, and `hipMemcpy` the four buffers yourself. The output `dD` must be sized for the chosen
   `OutType`.
+- **Split-K needs a caller-provided workspace.** For workgroup-starved shapes (narrow N + large K),
+  `gemm()` splits K and writes FP32 partial sums to a scratch buffer you supply via `ws`/`ws_bytes`,
+  then reduces them into `dD` (bit-reproducible — segments summed in a fixed order). Size the buffer
+  with `gemm_workspace_size(M, N, Kp)` (returns 0 for shapes that don't split), allocate it once on
+  the device, and reuse it across calls — do **not** `hipMalloc`/`hipFree` per call (measured ~1.3 ms,
+  it would erase the speedup). Pass `(nullptr, 0)` to never split. If a shape would split but `ws` is
+  null or too small, `gemm()` runs unsplit (still correct, just slower) and logs a warning to stderr.
+  Allocating per-stream avoids data races. See [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) §8.
 - **Targets gfx950 (CDNA4 / MI350X).** The kernel uses `v_mfma_scale_f32_32x32x64_f8f6f4`.
 
 ---
