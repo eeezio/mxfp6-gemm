@@ -17,21 +17,26 @@ TileChoice choose_tile(int M, int N) {
     return {256, 256, 4, 4};      // workhorse: 16-acc sweet spot
 }
 
+size_t gemm_workspace_size(int M, int N, int Kp) {
+    return detail::splitk_workspace_bytes(M, N, Kp);
+}
+
 void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, const uint8_t* dsA,
-          const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes) {
+          const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes, void* ws,
+          size_t ws_bytes) {
     switch (ot) {
         case OutType::F32:
             detail::dispatch_gemm<float>(M, N, Kp, dA, dBsh, dsA, dsB, static_cast<float*>(dD),
-                                         A_row_bytes, B_row_bytes);
+                                         A_row_bytes, B_row_bytes, ws, ws_bytes);
             break;
         case OutType::F16:
             detail::dispatch_gemm<__half>(M, N, Kp, dA, dBsh, dsA, dsB, static_cast<__half*>(dD),
-                                          A_row_bytes, B_row_bytes);
+                                          A_row_bytes, B_row_bytes, ws, ws_bytes);
             break;
         case OutType::BF16:
             detail::dispatch_gemm<__hip_bfloat16>(M, N, Kp, dA, dBsh, dsA, dsB,
                                                   static_cast<__hip_bfloat16*>(dD), A_row_bytes,
-                                                  B_row_bytes);
+                                                  B_row_bytes, ws, ws_bytes);
             break;
     }
 }

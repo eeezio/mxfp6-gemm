@@ -133,3 +133,28 @@ are extended to a non-NaN value via `pad_scales_k`.
   per-row padding, saving that overhead.
 - The E8M0 scale byte `0xFF` decodes to NaN, and `0·NaN = NaN` would poison the entire output, so
   A's K-tail scales must be padded to a non-NaN value (127) to keep results correct.
+
+---
+
+## 8. Split-K for WG-starved narrow-N / large-K shapes
+
+**What**: For shapes whose base grid underfills the machine, the K dimension is split into `S` equal
+segments computed by independent workgroups (a third grid dimension). Each writes an FP32 partial
+result to a workspace; a lightweight reduce kernel then sums the `S` layers and converts to the
+output type. It is auto-selected in `dispatch_gemm` and invisible at the public API. Where section 6
+fills the CUs along M/N, split-K is the complementary lever that fills them along K.
+
+**Why**: A narrow-N + large-K shape (e.g. `M=2048, N=1024`) launches only `(M/128)·(N/256) = 64`
+workgroups for 256 CUs, idling three-quarters of the machine, and the small tile cannot help (N is
+already only 4 tiles wide). The one dimension left to harvest is K, and split-K turns it into `64×S`
+workgroups — roughly doubling throughput on these shapes (≈555→1180 TFLOPs at S=4). The reduce runs
+as a separate fixed-order pass (bit-reproducible, and it keeps the GEMM epilogue unchanged) rather
+than via non-deterministic atomics. Its FP32 partial-sum buffer is **caller-provided** (sized via
+`gemm_workspace_size`, allocated once and reused) rather than allocated internally per call — a
+per-call `hipMalloc`/`hipFree` was measured at ~1.3 ms (~14× the GEMM) and would erase the gain;
+caller ownership also lets a multi-stream caller give each stream its own buffer (no data race).
+
+> `S = ceil(CU/base_wg)`, capped to keep ≥8 deep tiles per segment and reduced until it divides the
+> deep-tile count evenly; shapes that already fill the CUs get `S=1` and the original path. Split-K
+> reuses the full-K scale/B layouts (each segment just adds a `kt_base` offset), and the pad-B-only
+> recipe (§7) still holds — only the last segment touches the zero K-tail.

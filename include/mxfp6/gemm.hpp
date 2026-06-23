@@ -11,6 +11,7 @@
 // quantize A / preprocess+preshuffle B / tile the scales with mxfp6/preprocess.hpp first,
 // using choose_tile(M,N).{MPW,NPW} for the scale grouping. Kp = K padded up to a multiple
 // of the K-tile (192).
+#include <cstddef>
 #include <cstdint>
 
 namespace mxfp6 {
@@ -32,12 +33,22 @@ struct TileChoice {
 };
 TileChoice choose_tile(int M, int N);
 
+// Bytes of split-K workspace required for (M, N, Kp) — pass the same Kp you pass to gemm().
+// Returns 0 for shapes that don't split (most shapes); for WG-starved narrow-N/large-K shapes it
+// returns the size of the FP32 partial-sum buffer to allocate and hand to gemm() as `ws`. The
+// caller owns this device buffer (alloc once, reuse across calls); sizing it from this function
+// guarantees a match with what gemm() needs.
+size_t gemm_workspace_size(int M, int N, int Kp);
+
 // D[M,N] = A[M,K] * B[K,N], MXFP6 E2M3 inputs + per-32-block E8M0 scales.
 //   dA   : packed MXFP6 A (row-major), A_row_bytes per row
 //   dBsh : preshuffled MXFP6 B (preshuffle_B layout)
 //   dsA  : tiled A scales (tile_scale with MPW)   dsB: tiled B scales (tile_scale with NPW)
 //   dD   : output buffer of element type `ot` (float / __half / __hip_bfloat16)
+//   ws/ws_bytes : caller-provided split-K workspace (device). Size with gemm_workspace_size().
+//     Pass (nullptr, 0) to never split. If a shape would split but ws is null/too small, gemm()
+//     runs unsplit (still correct, just without the speedup) and logs a warning to stderr.
 void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, const uint8_t* dsA,
-          const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes);
+          const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes, void* ws, size_t ws_bytes);
 
 }  // namespace mxfp6

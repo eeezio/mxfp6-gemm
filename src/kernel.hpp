@@ -71,13 +71,14 @@ __device__ __forceinline__ void issue_A_chunks(uint32_t lds_base, int row_stride
 //   STRIDE=1, PER=1, STOP=NB. ADRIP_START=0 reproduces the original front-loaded schedule;
 //   batching (PER>=2) was swept and lost. swz0 stays best for drip-A (swz32 did not help).
 template <int M_TILE, int N_TILE, int K_TILE, int WAVES_M, int WAVES_N, int MIN_OCC = 1,
-          int SWZ = 0, typename OutT = float, int PFD = 5, bool HARD_WAIT = true,
-          int ADRIP_START = 1, int ADRIP_STRIDE = 1, int ADRIP_PER = 1, int ADRIP_STOP = 0>
+          int SWZ = 0, typename OutT = float, bool SPLITK = false, int PFD = 5,
+          bool HARD_WAIT = true, int ADRIP_START = 1, int ADRIP_STRIDE = 1, int ADRIP_PER = 1,
+          int ADRIP_STOP = 0>
 __global__ void __launch_bounds__(256, MIN_OCC)
     lds_gemm_hybrid_dripA(const void* __restrict__ A, const void* __restrict__ B,
                           const uint8_t* __restrict__ sA, const uint8_t* __restrict__ sB,
                           OutT* __restrict__ D, int N, int k_iters, int A_row_bytes,
-                          int B_row_bytes) {
+                          int B_row_bytes, int kt_base, int k_tiles_seg, float* __restrict__ Dpart) {
     constexpr int KT_BYTES = K_TILE * 6 / 8;
     constexpr int ROW_CHUNKS = KT_BYTES / 16;
     constexpr int K64_PER_TILE = K_TILE / 64;
@@ -114,6 +115,9 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     static_assert(NDA == 1 && NDB == 1, "tiled-scale path assumes <=4 blocks/wave");
     int sa_grp = wg_m * WAVES_M + wm, sb_grp = wg_n * WAVES_N + wn;
     int k_tiles = k_iters / K64_PER_TILE;
+    if constexpr (SPLITK) {
+        kt_base = blockIdx.z * k_tiles_seg;   // host passes kt_base=0, k_tiles_seg=seg_tiles
+    }
 
     // A buffer descriptor (Ag constant across the kernel)
     uint64_t ab = reinterpret_cast<uint64_t>(Ag);
@@ -122,9 +126,9 @@ __global__ void __launch_bounds__(256, MIN_OCC)
 
     auto load_scales = [&](int kt, int (*sa)[NDA], int (*sb)[NDB]) {
         const char* pa = reinterpret_cast<const char*>(sA) +
-                         (size_t)((sa_grp * k_tiles + kt) * 64 + lane) * K64_PER_TILE * SA_PAD;
+                         (size_t)((sa_grp * k_tiles + kt_base + kt) * 64 + lane) * K64_PER_TILE * SA_PAD;
         const char* pb = reinterpret_cast<const char*>(sB) +
-                         (size_t)((sb_grp * k_tiles + kt) * 64 + lane) * K64_PER_TILE * SB_PAD;
+                         (size_t)((sb_grp * k_tiles + kt_base + kt) * 64 + lane) * K64_PER_TILE * SB_PAD;
         int ta[K64_PER_TILE], tb[K64_PER_TILE];
         asm_load_dwordxN_nowait(ta, pa, K64_PER_TILE);
         asm_load_dwordxN_nowait(tb, pb, K64_PER_TILE);
@@ -138,7 +142,7 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     // compute tile kt_cur from buffer `cur`; if adrip, drip A(kt_nxt) into buffer nxt_base.
     auto compute = [&](uint32_t cur, uint32_t nxt_base, int kt_cur, int kt_nxt, bool adrip,
                        const int (*sa)[NDA], const int (*sb)[NDB]) {
-        int kb_nxt = kt_nxt * KT_BYTES;
+        int kb_nxt = (kt_base + kt_nxt) * KT_BYTES;
         v6i bring[PFD];
         int sbring[PFD];
 #pragma unroll
@@ -146,7 +150,7 @@ __global__ void __launch_bounds__(256, MIN_OCC)
             if (q < NB) {
                 int s = q / N_PW, n = q % N_PW, blk = wn * N_PW + n;
                 bring[q] = load_b_shuf(reinterpret_cast<const char*>(B), k_iters,
-                                       wg_n * N_BLKS + blk, kt_cur * K64_PER_TILE + s, lane);
+                                       wg_n * N_BLKS + blk, (kt_base + kt_cur) * K64_PER_TILE + s, lane);
                 sbring[q] = (sb[s][n / 4] >> (8 * (n % 4))) & 0xff;
             }
         v6i a[M_PW];
@@ -168,7 +172,7 @@ __global__ void __launch_bounds__(256, MIN_OCC)
                 int np = p + PFD, ns = np / N_PW, nn = np % N_PW, nblk = wn * N_PW + nn;
                 bring[(p + PFD) % PFD] =
                     load_b_shuf(reinterpret_cast<const char*>(B), k_iters, wg_n * N_BLKS + nblk,
-                                kt_cur * K64_PER_TILE + ns, lane);
+                                (kt_base + kt_cur) * K64_PER_TILE + ns, lane);
                 sbring[(p + PFD) % PFD] = (sb[ns][nn / 4] >> (8 * (nn % 4))) & 0xff;
             }
             // DRIP A (tunable LINEAR schedule; default = 1 chunk/quartet front-loaded)
@@ -192,23 +196,25 @@ __global__ void __launch_bounds__(256, MIN_OCC)
 
     int sa0[K64_PER_TILE][NDA], sa1[K64_PER_TILE][NDA], sb0[K64_PER_TILE][NDB],
         sb1[K64_PER_TILE][NDB];
-    // prologue: tile 0 A bursted into buf0 (no compute to drip into yet) + its scales
+    // prologue: tile 0 A bursted into buf0 (no compute to drip into yet) + its scales.
+    // A's global K-byte offset is kt_base*KT_BYTES (0 for non-split; the segment's first tile
+    // under split-K) — must match the drip path's (kt_base+kt_nxt)*KT_BYTES.
     load_scales(0, sa0, sb0);
-    issue_A_chunks<ROW_CHUNKS, M_TILE * ROW_CHUNKS>(0, A_row_bytes, 0, wave, lane, arsrc, 0,
-                                                    ISSUES_A);
+    issue_A_chunks<ROW_CHUNKS, M_TILE * ROW_CHUNKS>(0, A_row_bytes, kt_base * KT_BYTES, wave, lane,
+                                                    arsrc, 0, ISSUES_A);
     int kt = 0;
-    for (; kt + 1 < k_tiles; kt += 2) {
+    for (; kt + 1 < k_tiles_seg; kt += 2) {
         if (HARD_WAIT) wait_vmcnt(0);
         __syncthreads();
         load_scales(kt + 1, sa1, sb1);
         compute(0, A_BYTES, kt, kt + 1, true, sa0, sb0);  // compute buf0, drip A(kt+1)->buf1
-        bool pf = (kt + 2 < k_tiles);
+        bool pf = (kt + 2 < k_tiles_seg);
         if (HARD_WAIT) wait_vmcnt(0);
         __syncthreads();
         if (pf) load_scales(kt + 2, sa0, sb0);
         compute(A_BYTES, 0, kt + 1, kt + 2, pf, sa1, sb1);  // compute buf1, drip A(kt+2)->buf0
     }
-    if (kt < k_tiles) {
+    if (kt < k_tiles_seg) {
         wait_vmcnt(0);
         __syncthreads();
         compute(0, 0, kt, 0, false, sa0, sb0);
@@ -232,9 +238,30 @@ __global__ void __launch_bounds__(256, MIN_OCC)
             for (int g = 0; g < 4; g++) {
                 int m0 = mb + g * 8 + nh * 4;
 #pragma unroll
-                for (int j = 0; j < 4; j++) D[(size_t)(m0 + j) * N + n] = (OutT)a[g * 4 + j];
+                for (int j = 0; j < 4; j++) {
+                    if constexpr (SPLITK) {
+                        size_t Mtot = (size_t)gridDim.x * M_TILE;
+                        size_t seg_off = (size_t)blockIdx.z * Mtot * N;
+                        Dpart[seg_off + (size_t)(m0 + j) * N + n] = a[g * 4 + j];
+                    } else {
+                        D[(size_t)(m0 + j) * N + n] = (OutT)a[g * 4 + j];
+                    }
+                }
             }
         }
+}
+
+// Split-K stage 2: sum Dpart[S][M][N] (FP32 partial sums) in fixed order s=0..S-1, convert to
+// OutT, write D. One thread per output element; adjacent threads read consecutive idx ->
+// coalesced; fixed add order -> bit-reproducible.
+template <typename OutT>
+__global__ void reduce_splitk(const float* __restrict__ Dpart, OutT* __restrict__ D,
+                              long total, int S) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    float acc = 0.f;
+    for (int s = 0; s < S; s++) acc += Dpart[(size_t)s * total + idx];
+    D[idx] = (OutT)acc;
 }
 
 }  // namespace mxfp6
