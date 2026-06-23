@@ -180,8 +180,16 @@ static void perf(int M, int N, int K) {
     hipMalloc(&dD, (size_t)M * N * 2);
     auto run = [&] { gemm(OutType::F16, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br); };
     double ms = bench(run);
-    int wg = (M / 256) * (N / 256);
-    printf("  %5dx%5dx%5d wg256=%4d -> %3dx%3d : %.0f TFLOPs\n", M, N, K, wg, tc.MT, tc.NT,
+    // mirror dispatch's split decision for reporting only (CU=256, MIN_TILES_PER_SEG=8)
+    int k_tiles = x.Kp / KT, base_wg = (M / tc.MT) * (N / 256), S = 1;
+    if (base_wg < 256 && k_tiles >= 16) {
+        S = (256 + base_wg - 1) / base_wg;
+        int cap = k_tiles / 8;
+        if (S > cap) S = cap;
+        while (S > 1 && (k_tiles % S) != 0) S--;
+    }
+    int wg = base_wg * S;
+    printf("  %5dx%5dx%5d wg=%4d S=%d -> %3dx%3d : %.0f TFLOPs\n", M, N, K, wg, S, tc.MT, tc.NT,
            tf(M, N, K, ms));
     hipFree(dD);
     teardown(x);
@@ -197,15 +205,18 @@ int main() {
     f += !verify_compact(4096, 4096, 224);  // -> 256x256, 2 k_tiles
     f += !verify_compact(768, 1280, 224);   // -> 128x256, non-square, 2 k_tiles
     f += !verify_compact(512, 512, 160);    // -> 128x256, k_tiles==1 (odd tail), compact
+    f += !verify_compact(2048, 1024, 12288);  // -> split-K (S=4): base_wg=64<256, k_tiles=64
+    f += !verify_compact(2048, 1024, 3808);   // -> split-K (S=2) WITH real K-tail: K%192=160,
+                                              //    k_tiles=20, last segment includes the pad tile
     if (f) {
         printf("  CORRECTNESS FAILED\n");
         return 1;
     }
     printf("  all OK\n");
-    printf("\n=== indicative perf (12 shapes), FP16 ===\n");
-    int sh[][3] = {{8192, 8192, 8192}, {8192, 4096, 8192}, {4096, 8192, 8192}, {8192, 9216, 8192},
-                   {8192, 7680, 8192}, {8192, 5120, 8192}, {4096, 5120, 8192}, {4096, 4096, 8192},
-                   {2048, 8192, 8192}, {2048, 4096, 8192}, {2048, 2048, 8192}, {1024, 4096, 4096}};
+    printf("\n=== first-tier shapes (M=2048), FP16 ===\n");
+    int sh[][3] = {{2048, 1024, 12288},   // tier-1: narrow N + large K
+                   {2048, 1024, 16128},   // tier-1: narrow N + larger K
+                   {2048, 6144, 16128}};  // control: wide N, same K (record speedup 0.886)
     for (auto& s : sh) perf(s[0], s[1], s[2]);
     return 0;
 }
