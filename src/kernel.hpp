@@ -116,7 +116,9 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     int sa_grp = wg_m * WAVES_M + wm, sb_grp = wg_n * WAVES_N + wn;
     int k_tiles = k_iters / K64_PER_TILE;
     if constexpr (SPLITK) {
-        kt_base = blockIdx.z * k_tiles_seg;   // host passes kt_base=0, k_tiles_seg=seg_tiles
+        int z = blockIdx.z, seg_floor = kt_base, seg_rem = k_tiles_seg;
+        kt_base = z * seg_floor + (z < seg_rem ? z : seg_rem);
+        k_tiles_seg = seg_floor + (z < seg_rem ? 1 : 0);
     }
 
     // A buffer descriptor (Ag constant across the kernel)

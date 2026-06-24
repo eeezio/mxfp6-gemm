@@ -32,7 +32,6 @@ inline int splitk_S(int M, int N, int Kp) {
         int s_cap = k_tiles / MIN_TILES_PER_SEG;      // each segment not shorter than the floor
         if (S > s_cap) S = s_cap;
         if (S < 1) S = 1;
-        while (S > 1 && (k_tiles % S) != 0) S--;       // divisibility: equal-length segments, kernel uses blockIdx.z
     }
     return S;
 }
@@ -71,7 +70,7 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
         }
     }
     if (S > 1) {
-        int seg_tiles = k_tiles / S;                  // exact (splitk_S guarantees divisibility)
+        int seg_floor = k_tiles / S, seg_rem = k_tiles % S;
         size_t total = (size_t)M * N;
         float* Dpart = static_cast<float*>(ws);
         if (tc.MT == 128) {
@@ -79,13 +78,13 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
             int lds = 2 * (128 * (KT * 6 / 8));
             lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, true>
                 <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
-                                  0, seg_tiles, Dpart);
+                                  seg_floor, seg_rem, Dpart);
         } else {
             dim3 g(M / 256, N / 256, S);
             int lds = 2 * (256 * (KT * 6 / 8));
             lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, 0, OutT, true>
                 <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
-                                  0, seg_tiles, Dpart);
+                                  seg_floor, seg_rem, Dpart);
         }
         int threads = 256;
         long red_blocks = ((long)total + threads - 1) / threads;
