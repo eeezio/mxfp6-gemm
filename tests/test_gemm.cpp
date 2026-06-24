@@ -218,6 +218,7 @@ int main() {
     f += !verify_compact(2048, 1024, 12288);  // -> split-K (S=4): base_wg=64<256, k_tiles=64
     f += !verify_compact(2048, 1024, 3808);   // -> split-K (S=2) WITH real K-tail: K%192=160,
                                               //    k_tiles=20, last segment includes the pad tile
+    f += !verify_compact(2048, 1024, 6304);
     if (f) {
         printf("  CORRECTNESS FAILED\n");
         return 1;
@@ -226,6 +227,7 @@ int main() {
     printf("\n=== first-tier shapes (M=2048), FP16 ===\n");
     int sh[][3] = {{2048, 1024, 12288},   // tier-1: narrow N + large K
                    {2048, 1024, 16128},   // tier-1: narrow N + larger K
+                   {2048, 1024, 105728},
                    {2048, 6144, 16128}};  // control: wide N, same K (record speedup 0.886)
     for (auto& s : sh) perf(s[0], s[1], s[2]);
     return 0;
