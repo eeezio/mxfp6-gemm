@@ -154,7 +154,36 @@ than via non-deterministic atomics. Its FP32 partial-sum buffer is **caller-prov
 per-call `hipMalloc`/`hipFree` was measured at ~1.3 ms (~14× the GEMM) and would erase the gain;
 caller ownership also lets a multi-stream caller give each stream its own buffer (no data race).
 
-> `S = ceil(CU/base_wg)`, capped to keep ≥8 deep tiles per segment and reduced until it divides the
-> deep-tile count evenly; shapes that already fill the CUs get `S=1` and the original path. Split-K
-> reuses the full-K scale/B layouts (each segment just adds a `kt_base` offset), and the pad-B-only
-> recipe (§7) still holds — only the last segment touches the zero K-tail.
+> `S = ceil(CU/base_wg)`, capped to keep ≥8 deep tiles per segment; shapes that already fill the CUs
+> get `S=1` and the original path. Segments may be **uneven** — the first `k_tiles % S` take one extra
+> tile, so `S` need not divide `k_tiles` (each WG derives its `(kt_base, length)` from `blockIdx.z`).
+> This is what lets very-large-K shapes split even when `k_tiles` is prime-ish: `K=105728` →
+> `k_tiles=551 (=19·29)`, which the old "reduce S until it divides evenly" rule collapsed to `S=1`;
+> uneven keeps `S=4` (138/138/138/137) → **491→1437 TFLOPs**. Split-K reuses the full-K scale/B
+> layouts (each segment just adds a `kt_base` offset), and the pad-B-only recipe (§7) still holds —
+> only the last segment touches the zero K-tail.
+
+**Reduce-cost-aware guard.** A split is not free: it adds an FP32 partial-sum reduce round-trip
+(`~S·M·N·4` bytes), and it only buys GEMM parallelism up to a full CU wave. Naively taking
+`S = ceil(CU/base_wg)` whenever `base_wg < CU` regresses two classes:
+> 1. **Oversubscribed grids** — `base_wg` that doesn't divide `CU` (e.g. `base_wg=192`, `S=2` →
+>    `384 > 256` WGs → 2 waves). Each WG still does `k_tiles/2` work over 2 waves = the unsplit wall
+>    time, so the GEMM gains *nothing* while paying the full reduce. Measured: every `N=3072` `S=2`
+>    shape lost (down to 0.45×).
+> 2. **Shallow-K near-full grids** — `base_wg=128`, `S=2`, modest `K`: the reduce dominates the small
+>    depth gain. Measured: `2048×2048×3490` regressed 931→838 (0.90×).
+
+The guard models both. With `W = ceil(base_wg·S / CU)` (the CU-waves the split grid occupies), the
+effective depth gain is `(S − W)/S` (not `1 − 1/S`), and the reduce cost scales as `S²·base_wg`.
+Split only when the GEMM time saved clears it:
+
+```
+W = ceil(base_wg * S / CU)
+split iff   Kp * (S - W)  >  ALPHA * base_wg * S²      (ALPHA = 10, gfx950)
+```
+
+`ALPHA` is a per-architecture compute/bandwidth balance constant, calibrated on a 30-shape
+`base_wg × K` sweep (unsplit-vs-split speedup measured for each; the win/loss boundary lands at the
+margin `Kp·(S−W)/(S²·base_wg) ≈ 8–10`, conservatively 10). Validated: it drops the `2048×2048×3490`
+(→ `S=1`, 905) and `N=3072` (→ `S=1`, 1408) regressions, **keeps** the deep-K `S=2` win
+`2048×1024×3490` (524 vs 503), and leaves every `S=4` win unchanged. See `benchmark_results.md`.
