@@ -34,11 +34,16 @@ Shapes with a small N and a large K launch too few workgroups to fill the machin
 (25 % occupancy). For these the library automatically splits the K dimension across independent
 workgroups (**split-K**, see [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) §8). FP16, MI350X:
 
-| M × N × K | without split-K | with split-K (S) | speedup |
-|---|---:|---:|---:|
-| 2048 × 1024 × 12288 | 555 | **1180** (S=4) | **2.13×** |
-| 2048 × 1024 × 16128 | 569 | **1326** (S=4) | **2.33×** |
-| 2048 × 6144 × 16128 | 1588 | 1588 (no split) | — |
+| M × N × K | without split-K (TFLOPs) | with split-K (TFLOPs) | S | speedup | vs CK MXFP8 |
+|---|---:|---:|---:|---:|---:|
+| 2048 × 1024 × 12288  | 561 | **1109** | 4 | **1.98×** | 1.02× (CK 1087) |
+| 2048 × 1024 × 16128  | 570 | **1255** | 4 | **2.20×** | 1.11× (CK 1135) |
+| 2048 × 1024 × 105728 | 491 | **1437** | 4 | **2.93×** | **1.57× (CK 912)** |
+| 2048 × 512 × 6144    | 277 | **483**  | 4 | **1.74×** | 0.91× (CK 533) |
+| 2048 × 6144 × 16128  | 1588 | 1586 (no split) | 1 | — | control |
+
+Re-measured on MI350X / ROCm 7.0.2 (2026-06-30). The S=1 (no-split) path is unchanged by the
+split-K work — verified by an A/B build of the pre-split-K commit (<1% delta).
 
 Split-K is enabled inside `gemm()` for workgroup-starved shapes when you supply a scratch buffer
 (sized via `gemm_workspace_size`, see below); shapes that already fill the CUs (e.g. wide N) skip it
