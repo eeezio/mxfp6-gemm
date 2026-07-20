@@ -85,7 +85,8 @@ static void teardown(Dev& x) {
 }
 
 static bool verify(int M, int N, int K) {
-    TileChoice tc = choose_tile(M, N);
+    int Kp_est = ((K + K_TILE - 1) / K_TILE) * K_TILE;
+    TileChoice tc = choose_tile(M, N, Kp_est);
     Dev x = setup(M, N, K, tc);
     std::vector<float> Dref((size_t)M * N);
     mxfp6_gemm_ref(x.Aq, x.Bq, Dref.data(), M, x.Kp, N);
@@ -116,8 +117,8 @@ static bool verify(int M, int N, int K) {
 // scales kpad-extended with a non-NaN tail (pad_scales_k). Compared to the correct GEMM (a
 // zero-Kp-padded A reference). Exercises the inter-row K-tail overlap nulled by B's zero tail.
 static bool verify_compact(int M, int N, int K) {
-    TileChoice tc = choose_tile(M, N);
     int Kp = kpad(K);
+    TileChoice tc = choose_tile(M, N, Kp);
     std::mt19937 rng(M * 5 + N * 11 + K * 2);
     std::uniform_real_distribution<float> d(-1, 1);
     std::vector<float> Areal((size_t)M * K), Bf((size_t)Kp * N, 0.f);
@@ -182,8 +183,37 @@ static bool verify_compact(int M, int N, int K) {
     hipFree(dD);
     return ok;
 }
+// Correctness check for the 128x128 kernel path on SMALL shapes (fast CPU ref, ~5e7 MACs).
+// Forces MPW=2/NPW=2 scale tiling and calls gemm_force_tile() to bypass choose_tile() routing,
+// so the 128x128 kernel is exercised even when Kp < the large-K threshold. M must be a multiple
+// of 128; N must be a multiple of 128.
+static bool verify_128x128(int M, int N, int K) {
+    constexpr TileChoice tc = {128, 128, 2, 2};
+    Dev x = setup(M, N, K, tc);
+    std::vector<float> Dref((size_t)M * N);
+    mxfp6_gemm_ref(x.Aq, x.Bq, Dref.data(), M, x.Kp, N);
+    float* dD;
+    hipMalloc(&dD, (size_t)M * N * 4);
+    hipMemset(dD, 0x5A, (size_t)M * N * 4);
+    gemm_force_tile(OutType::F32, M, N, x.Kp, tc, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br);
+    hipDeviceSynchronize();
+    std::vector<float> Dg((size_t)M * N);
+    hipMemcpy(Dg.data(), dD, (size_t)M * N * 4, hipMemcpyDeviceToHost);
+    hipFree(dD);
+    float er = 0, mx = 0;
+    for (size_t i = 0; i < (size_t)M * N; i++) {
+        er = fmaxf(er, fabsf(Dg[i] - Dref[i]));
+        mx = fmaxf(mx, fabsf(Dref[i]));
+    }
+    bool ok = er < 2e-2f * fmaxf(1.f, mx);
+    printf("  128x128 %4dx%4dx%4d : %s\n", M, N, K, ok ? "OK" : "FAIL<<<");
+    teardown(x);
+    return ok;
+}
+
 static void perf(int M, int N, int K) {
-    TileChoice tc = choose_tile(M, N);
+    int Kp_est = ((K + K_TILE - 1) / K_TILE) * K_TILE;
+    TileChoice tc = choose_tile(M, N, Kp_est);
     Dev x = setup(M, N, K, tc);
     __half* dD;
     hipMalloc(&dD, (size_t)M * N * 2);
@@ -195,7 +225,7 @@ static void perf(int M, int N, int K) {
         gemm(OutType::F16, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb);
     };
     double ms = bench(run);
-    int base_wg = (M / tc.MT) * (N / 256);
+    int base_wg = (M / tc.MT) * (N / tc.NT);
     int S = wsb ? (int)(wsb / ((size_t)M * N * sizeof(float))) : 1;  // S from workspace size
     int wg = base_wg * S;
     printf("  %5dx%5dx%5d wg=%4d S=%d -> %3dx%3d : %.0f TFLOPs\n", M, N, K, wg, S, tc.MT, tc.NT,
@@ -204,7 +234,12 @@ static void perf(int M, int N, int K) {
     hipFree(dD);
     teardown(x);
 }
-int main() {
+int main(int argc, char** argv) {
+    if (argc >= 4) {
+        int M = atoi(argv[1]), N = atoi(argv[2]), K = atoi(argv[3]);
+        perf(M, N, K);
+        return 0;
+    }
     printf("=== libmxfp6gemm correctness (end-to-end, CPU ref) ===\n");
     int f = 0;
     f += !verify(512, 512, 768);    // -> 128x256 path (wg256<CU)
@@ -219,6 +254,10 @@ int main() {
     f += !verify_compact(2048, 1024, 3808);   // -> split-K (S=2) WITH real K-tail: K%192=160,
                                               //    k_tiles=20, last segment includes the pad tile
     f += !verify_compact(2048, 1024, 6304);
+    // 128x128 kernel path: forced via gemm_force_tile() on small shapes (fast CPU ref ~5e7 MACs).
+    // 256x256x768: grid 2x2 WGs, k_tiles=4. 384x512x1536: grid 3x4 WGs, k_tiles=8.
+    f += !verify_128x128(256, 256, 768);
+    f += !verify_128x128(384, 512, 1536);
     if (f) {
         printf("  CORRECTNESS FAILED\n");
         return 1;
@@ -228,7 +267,8 @@ int main() {
     int sh[][3] = {{2048, 1024, 12288},   // tier-1: narrow N + large K
                    {2048, 1024, 16128},   // tier-1: narrow N + larger K
                    {2048, 1024, 105728},
-                   {2048, 6144, 16128}};  // control: wide N, same K (record speedup 0.886)
+                   {2048, 6144, 16128},   // control: wide N, same K (128x256 path, Kp<32768)
+                   {2048, 6144, 105728}}; // wide N + large K: 128x128 candidate
     for (auto& s : sh) perf(s[0], s[1], s[2]);
     return 0;
 }

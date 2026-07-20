@@ -1,0 +1,251 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c47adde..209e096 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -28,4 +28,12 @@ enable_testing()
+ add_executable(test_gemm tests/test_gemm.cpp)
+ set_source_files_properties(tests/test_gemm.cpp PROPERTIES LANGUAGE HIP)
+ target_link_libraries(test_gemm PRIVATE mxfp6gemm)
++target_include_directories(test_gemm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+ add_test(NAME gemm COMMAND test_gemm)
++
++# ---- Track 4: 128x128 B-through-LDS test (separate binary for A/B comparison) -------------
++add_executable(test_gemm128 tests/test_gemm128.cpp)
++set_source_files_properties(tests/test_gemm128.cpp PROPERTIES LANGUAGE HIP)
++target_link_libraries(test_gemm128 PRIVATE mxfp6gemm)
++target_include_directories(test_gemm128 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++add_test(NAME gemm128 COMMAND test_gemm128)
+diff --git a/src/dispatch.hpp b/src/dispatch.hpp
+index 9022143..c1f0226 100644
+--- a/src/dispatch.hpp
++++ b/src/dispatch.hpp
+@@ -10,7 +10,11 @@
+ //   * 256x256 (16-acc sweet spot) — workhorse for CU-filling shapes.
+ //   * 128x256 (8-acc)             — WG-starved small-M, to fill idle CUs.
+ // Same lds_gemm_hybrid_dripA kernel for both (tile-general); only the tile args differ.
++//
++// Track 4 extension: B-through-LDS path (dispatch_gemm_blds) for large-K shapes where B's
++// working set exceeds L2. Routes: Kp > 50000 && 128x256 tile && N divisible by 256.
+ #include "kernel.hpp"
++#include "kernel_blds.hpp"
+ #include "mxfp6/gemm.hpp"  // TileChoice, choose_tile (declarations)
+ namespace mxfp6 {
+ namespace detail {
+@@ -110,5 +114,32 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
+     }
+ }
+ 
++// dispatch_gemm_blds: B-through-LDS path for large-K/wide-N 128x256-tile shapes.
++// Requires: compact B^T [N_col][K_byte] buffer (NOT preshuffled), B_compact_row_bytes = Bq.packed_row_bytes.
++// Guard: Kp > 50000 && 128x256 tile is selected && N % 256 == 0.
++// Scales (dsA, dsB) are the same tiled-scale buffers as the original kernel.
++// Does NOT support split-K (those shapes have small Kp, orthogonal regime).
++template <typename OutT>
++inline void dispatch_gemm_blds(int M, int N, int Kp, const void* dA, const void* dBc,
++                               const uint8_t* dsA, const uint8_t* dsB, OutT* dD,
++                               int A_row_bytes, int B_compact_row_bytes) {
++    constexpr int KT = K_TILE;
++    dim3 blk(256);
++    int kit = Kp / 64;
++    // 128x256 tile: 2 waves_M x 2 waves_N = 4 waves / WG
++    dim3 g(M / 128, N / 256);
++    // LDS: 2*A_BYTES + 2*B_BYTES = 2*(128*KT_BYTES) + 2*(256*KT_BYTES) = 110592 bytes
++    constexpr int KT_BYTES = KT * 6 / 8;
++    int lds = 2 * (128 * KT_BYTES) + 2 * (256 * KT_BYTES);
++    lds_gemm_bLDS<128, 256, KT, 2, 2, 1, OutT>
++        <<<g, blk, lds>>>(dA, dBc, dsA, dsB, dD, N, kit, A_row_bytes, B_compact_row_bytes);
++}
++
++// Returns true if the B-through-LDS path should be used for this shape.
++inline bool use_blds_path(int M, int N, int Kp) {
++    TileChoice tc = choose_tile(M, N);
++    return (Kp > 50000) && (tc.MT == 128) && (N % 256 == 0);
++}
++
+ }  // namespace detail
+ }  // namespace mxfp6
+diff --git a/tests/test_gemm.cpp b/tests/test_gemm.cpp
+index b8131e1..8b16174 100644
+--- a/tests/test_gemm.cpp
++++ b/tests/test_gemm.cpp
+@@ -2,6 +2,10 @@
+ // routing + host tiled-scale (mxfp6/preprocess.hpp) + mxfp6::gemm() launch. Correctness
+ // (fresh-alloc + CPU ref) on both tile paths, then an indicative perf sweep over 12 shapes.
+ // (For precise numbers let the GPU reach steady state first; this is a functional gate.)
++//
++// Track 4: B-through-LDS path (verify_blds / perf_blds) — large-K/wide-N 128x256 shapes
++// where B's working set exceeds L2. Uses compact B^T (preprocess_B output, not preshuffled)
++// and calls detail::dispatch_gemm_blds directly (internal path, not in public API).
+ #include <hip/hip_fp16.h>
+ #include <hip/hip_runtime.h>
+ 
+@@ -13,7 +17,8 @@
+ #include "mxfp6/gemm.hpp"
+ #include "mxfp6/preprocess.hpp"
+ #include "mxfp6/types.hpp"
+-#include "reference.hpp"  // CPU reference GEMM (test-only, lives in tests/)
++#include "reference.hpp"      // CPU reference GEMM (test-only, lives in tests/)
++#include "../src/dispatch.hpp" // internal: dispatch_gemm_blds, use_blds_path
+ using namespace mxfp6;
+ static constexpr int KT = K_TILE;
+ 
+@@ -204,7 +209,124 @@ static void perf(int M, int N, int K) {
+     hipFree(dD);
+     teardown(x);
+ }
+-int main() {
++// ---- Track 4: B-through-LDS path tests ----
++// Setup for the bLDS kernel: uses compact B^T (preprocess_B output, not preshuffled).
++// Both A and B are staged through LDS double-buffers in the kernel.
++struct DevBlds {
++    void *dA, *dBc;             // dBc = compact B^T device buffer
++    uint8_t *dsA, *dsB;
++    int Ar, Bc_row;             // A_row_bytes, B_compact_row_bytes (= Bq.packed_row_bytes)
++    int Kp;
++    QuantizedMatrix Aq, Bq;
++};
++static DevBlds setup_blds(int M, int N, int K, TileChoice tc) {
++    int Kp = ((K + KT - 1) / KT) * KT;
++    std::mt19937 rng(M * 3 + N * 7 + K + 42);
++    std::uniform_real_distribution<float> d(-1, 1);
++    std::vector<float> Af((size_t)M * Kp, 0.f), Bf((size_t)Kp * N, 0.f);
++    for (int i = 0; i < M; i++)
++        for (int k = 0; k < K; k++) Af[(size_t)i * Kp + k] = d(rng);
++    for (int k = 0; k < K; k++)
++        for (int j = 0; j < N; j++) Bf[(size_t)k * N + j] = d(rng);
++    DevBlds x;
++    x.Aq = quantize_to_mxfp6(Af.data(), M, Kp);
++    x.Bq = preprocess_B(Bf.data(), Kp, N);  // compact B^T [N][Kp], packed FP6
++    // Scales: same tiled-scale layout as original kernel (MPW for A, NPW for B).
++    auto saC = tile_scale(preprocess_scale(x.Aq.scales.data(), M, Kp), tc.MPW, KT / 64);
++    auto sbC = tile_scale(preprocess_scale(x.Bq.scales.data(), N, Kp), tc.NPW, KT / 64);
++    hipMalloc(&x.dA, x.Aq.packed_data.size());
++    // Upload compact B^T (not preshuffled)
++    hipMalloc(&x.dBc, x.Bq.packed_data.size());
++    hipMalloc(&x.dsA, saC.data.size());
++    hipMalloc(&x.dsB, sbC.data.size());
++    hipMemcpy(x.dA, x.Aq.packed_data.data(), x.Aq.packed_data.size(), hipMemcpyHostToDevice);
++    hipMemcpy(x.dBc, x.Bq.packed_data.data(), x.Bq.packed_data.size(), hipMemcpyHostToDevice);
++    hipMemcpy(x.dsA, saC.data.data(), saC.data.size(), hipMemcpyHostToDevice);
++    hipMemcpy(x.dsB, sbC.data.data(), sbC.data.size(), hipMemcpyHostToDevice);
++    x.Ar = x.Aq.packed_row_bytes;
++    x.Bc_row = x.Bq.packed_row_bytes;  // fp6_packed_bytes(Kp)
++    x.Kp = Kp;
++    return x;
++}
++static void teardown_blds(DevBlds& x) {
++    hipFree(x.dA);
++    hipFree(x.dBc);
++    hipFree(x.dsA);
++    hipFree(x.dsB);
++}
++
++// Verify the B-through-LDS path against CPU reference.
++static bool verify_blds(int M, int N, int K) {
++    TileChoice tc = choose_tile(M, N);
++    if (!detail::use_blds_path(M, N, ((K + KT - 1) / KT) * KT)) {
++        printf("  bLDS %4dx%4dx%4d -> SKIP (not in bLDS regime)\n", M, N, K);
++        return true;
++    }
++    DevBlds x = setup_blds(M, N, K, tc);
++    std::vector<float> Dref((size_t)M * N);
++    mxfp6_gemm_ref(x.Aq, x.Bq, Dref.data(), M, x.Kp, N);
++    float* dD;
++    hipMalloc(&dD, (size_t)M * N * 4);
++    hipMemset(dD, 0x5A, (size_t)M * N * 4);
++    detail::dispatch_gemm_blds(M, N, x.Kp, x.dA, x.dBc, x.dsA, x.dsB, dD,
++                               x.Ar, x.Bc_row);
++    hipDeviceSynchronize();
++    std::vector<float> Dg((size_t)M * N);
++    hipMemcpy(Dg.data(), dD, (size_t)M * N * 4, hipMemcpyDeviceToHost);
++    hipFree(dD);
++    float er = 0, mx = 0;
++    size_t nans = 0;
++    for (size_t i = 0; i < (size_t)M * N; i++) {
++        if (std::isnan(Dg[i])) nans++;
++        er = fmaxf(er, fabsf(Dg[i] - Dref[i]));
++        mx = fmaxf(mx, fabsf(Dref[i]));
++    }
++    bool ok = nans == 0 && er < 2e-2f * fmaxf(1.f, mx);
++    printf("  bLDS %4dx%4dx%4d -> %dx%d : NaNs=%zu er=%.4f %s\n",
++           M, N, K, tc.MT, tc.NT, nans, er, ok ? "OK" : "FAIL<<<");
++    teardown_blds(x);
++    return ok;
++}
++
++// Perf benchmark for the B-through-LDS path (FP16 out).
++static void perf_blds(int M, int N, int K) {
++    TileChoice tc = choose_tile(M, N);
++    int Kp = ((K + KT - 1) / KT) * KT;
++    if (!detail::use_blds_path(M, N, Kp)) {
++        printf("  bLDS %5dx%5dx%5d -> SKIP\n", M, N, K);
++        return;
++    }
++    DevBlds x = setup_blds(M, N, K, tc);
++    __half* dD;
++    hipMalloc(&dD, (size_t)M * N * 2);
++    auto run = [&] {
++        detail::dispatch_gemm_blds(M, N, x.Kp, x.dA, x.dBc, x.dsA, x.dsB, dD,
++                                   x.Ar, x.Bc_row);
++    };
++    double ms = bench(run);
++    int base_wg = (M / tc.MT) * (N / 256);
++    printf("  bLDS %5dx%5dx%5d wg=%4d -> %3dx%3d : %.0f TFLOPs\n",
++           M, N, K, base_wg, tc.MT, tc.NT, tf(M, N, K, ms));
++    hipFree(dD);
++    teardown_blds(x);
++}
++// ---- end Track 4 ----
++
++int main(int argc, char** argv) {
++    // argv == 3 ints: run original perf path (lead's expected interface for benchmarking)
++    if (argc >= 4 && argv[1][0] != 'b') {
++        int M = atoi(argv[1]), N = atoi(argv[2]), K = atoi(argv[3]);
++        perf(M, N, K);
++        return 0;
++    }
++    // argv == "blds M N K": run B-through-LDS perf (e.g. ./test_gemm blds 2048 6144 105728)
++    if (argc >= 5 && argv[1][0] == 'b') {
++        int M = atoi(argv[2]), N = atoi(argv[3]), K = atoi(argv[4]);
++        printf("=== targeted bLDS perf: %dx%dx%d ===\n", M, N, K);
++        perf_blds(M, N, K);
++        return 0;
++    }
++
+     printf("=== libmxfp6gemm correctness (end-to-end, CPU ref) ===\n");
+     int f = 0;
+     f += !verify(512, 512, 768);    // -> 128x256 path (wg256<CU)
+@@ -224,11 +346,33 @@ int main() {
+         return 1;
+     }
+     printf("  all OK\n");
++
++    // Track 4: B-through-LDS correctness (large-K/wide-N shapes in the bLDS regime)
++    // Use small shapes for fast CPU reference; Kp>50000 is the guard threshold.
++    // 256x256 -> choose_tile gives 128x256 (wg=1<256), so bLDS path engages.
++    // K=57344 -> Kp=57408>50000 ✓. CPU ref: 256*256*57344 ops ~ 3.7G (fast enough).
++    // 512x512x57344 is also small enough; gives 128x256 tile (wg=4<256) ✓.
++    printf("\n=== B-through-LDS correctness (Track 4) ===\n");
++    int fb = 0;
++    fb += !verify_blds(256, 256, 57344);    // 128x256 tile, Kp=57408>50K -> bLDS (fast ref)
++    fb += !verify_blds(512, 512, 57344);    // 128x256 tile, Kp=57408>50K -> bLDS
++    fb += !verify_blds(256, 256, 4096);    // small K -> SKIP (not in bLDS regime, expected)
++    if (fb) {
++        printf("  B-through-LDS CORRECTNESS FAILED\n");
++        return 1;
++    }
++    printf("  B-through-LDS all OK\n");
++
+     printf("\n=== first-tier shapes (M=2048), FP16 ===\n");
+     int sh[][3] = {{2048, 1024, 12288},   // tier-1: narrow N + large K
+                    {2048, 1024, 16128},   // tier-1: narrow N + larger K
+                    {2048, 1024, 105728},
+                    {2048, 6144, 16128}};  // control: wide N, same K (record speedup 0.886)
+     for (auto& s : sh) perf(s[0], s[1], s[2]);
++
++    // Track 4: B-through-LDS perf (target shapes)
++    printf("\n=== B-through-LDS perf (Track 4, FP16) ===\n");
++    perf_blds(2048, 6144, 16128);
++    perf_blds(2048, 6144, 105728);
+     return 0;
+ }

@@ -26,12 +26,16 @@ inline int kpad(int K) {
     return (K + K_TILE - 1) / K_TILE * K_TILE;
 }
 
-// Tile chosen for (M,N). MPW/NPW = per-wave 32-block counts (2x2 waves); the host scale
+// Tile chosen for (M,N[,Kp]). MPW/NPW = per-wave 32-block counts (2x2 waves); the host scale
 // tiling (tile_scale) must use these for A and B respectively.
+// Kp (optional, default 0 = unknown): when provided, enables K-aware routing (e.g. 128x128 for
+// large-K wide-N shapes). Callers that know Kp (dispatch_gemm, perf benchmarks) should pass it so
+// the tile choice matches the kernel that will actually run. Callers that don't know K (e.g. scale
+// pre-processing at quantization time) pass the default 0 and get the M/N-only heuristic.
 struct TileChoice {
     int MT, NT, MPW, NPW;
 };
-TileChoice choose_tile(int M, int N);
+TileChoice choose_tile(int M, int N, int Kp = 0);
 
 // Bytes of split-K workspace required for (M, N, Kp) — pass the same Kp you pass to gemm().
 // Returns 0 for shapes that don't split (most shapes); for WG-starved narrow-N/large-K shapes it
@@ -50,5 +54,13 @@ size_t gemm_workspace_size(int M, int N, int Kp);
 //     runs unsplit (still correct, just without the speedup) and logs a warning to stderr.
 void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, const uint8_t* dsA,
           const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes, void* ws, size_t ws_bytes);
+
+// Like gemm() but uses the caller-supplied TileChoice instead of calling choose_tile(). Intended
+// for testing: forces a specific tile path (e.g. 128x128) on small shapes where choose_tile would
+// return a different tile. The caller MUST have tiled the scales with tc.MPW/tc.NPW.
+// Split-K is not applied (pass ws=nullptr/ws_bytes=0); M,N must be exact multiples of tc.MT/tc.NT.
+void gemm_force_tile(OutType ot, int M, int N, int Kp, TileChoice tc, const void* dA,
+                     const void* dBsh, const uint8_t* dsA, const uint8_t* dsB, void* dD,
+                     int A_row_bytes, int B_row_bytes);
 
 }  // namespace mxfp6

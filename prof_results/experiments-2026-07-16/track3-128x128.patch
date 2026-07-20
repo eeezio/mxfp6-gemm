@@ -1,0 +1,291 @@
+diff --git a/include/mxfp6/gemm.hpp b/include/mxfp6/gemm.hpp
+index d0fd201..b4bc65b 100644
+--- a/include/mxfp6/gemm.hpp
++++ b/include/mxfp6/gemm.hpp
+@@ -26,12 +26,16 @@ inline int kpad(int K) {
+     return (K + K_TILE - 1) / K_TILE * K_TILE;
+ }
+ 
+-// Tile chosen for (M,N). MPW/NPW = per-wave 32-block counts (2x2 waves); the host scale
++// Tile chosen for (M,N[,Kp]). MPW/NPW = per-wave 32-block counts (2x2 waves); the host scale
+ // tiling (tile_scale) must use these for A and B respectively.
++// Kp (optional, default 0 = unknown): when provided, enables K-aware routing (e.g. 128x128 for
++// large-K wide-N shapes). Callers that know Kp (dispatch_gemm, perf benchmarks) should pass it so
++// the tile choice matches the kernel that will actually run. Callers that don't know K (e.g. scale
++// pre-processing at quantization time) pass the default 0 and get the M/N-only heuristic.
+ struct TileChoice {
+     int MT, NT, MPW, NPW;
+ };
+-TileChoice choose_tile(int M, int N);
++TileChoice choose_tile(int M, int N, int Kp = 0);
+ 
+ // Bytes of split-K workspace required for (M, N, Kp) — pass the same Kp you pass to gemm().
+ // Returns 0 for shapes that don't split (most shapes); for WG-starved narrow-N/large-K shapes it
+@@ -51,4 +55,12 @@ size_t gemm_workspace_size(int M, int N, int Kp);
+ void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, const uint8_t* dsA,
+           const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes, void* ws, size_t ws_bytes);
+ 
++// Like gemm() but uses the caller-supplied TileChoice instead of calling choose_tile(). Intended
++// for testing: forces a specific tile path (e.g. 128x128) on small shapes where choose_tile would
++// return a different tile. The caller MUST have tiled the scales with tc.MPW/tc.NPW.
++// Split-K is not applied (pass ws=nullptr/ws_bytes=0); M,N must be exact multiples of tc.MT/tc.NT.
++void gemm_force_tile(OutType ot, int M, int N, int Kp, TileChoice tc, const void* dA,
++                     const void* dBsh, const uint8_t* dsA, const uint8_t* dsB, void* dD,
++                     int A_row_bytes, int B_row_bytes);
++
+ }  // namespace mxfp6
+diff --git a/src/dispatch.hpp b/src/dispatch.hpp
+index 9022143..2e1ec68 100644
+--- a/src/dispatch.hpp
++++ b/src/dispatch.hpp
+@@ -23,9 +23,9 @@ inline int splitk_S(int M, int N, int Kp) {
+     constexpr int KT = K_TILE;
+     constexpr int CU = 256;                 // MI350X (gfx950)
+     constexpr int MIN_TILES_PER_SEG = 8;    // min deep tiles per segment (amortize prologue + small-K gate)
+-    TileChoice tc = choose_tile(M, N);
++    TileChoice tc = choose_tile(M, N, Kp);
+     int k_tiles = (Kp / 64) / (KT / 64);    // total deep tiles for full K = Kp/192
+-    int base_wg = (M / tc.MT) * (N / 256);
++    int base_wg = (M / tc.MT) * (N / tc.NT);
+     int S = 1;
+     if (base_wg < CU && k_tiles >= 2 * MIN_TILES_PER_SEG) {
+         S = (CU + base_wg - 1) / base_wg;             // ceil(CU/base_wg): min segments to fill CUs
+@@ -55,7 +55,7 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
+     dim3 blk(256);
+     int kit = Kp / 64;
+     int k_tiles = kit / (KT / 64);          // total deep tiles for full K = Kp/192
+-    TileChoice tc = choose_tile(M, N);
++    TileChoice tc = choose_tile(M, N, Kp);
+     int S = splitk_S(M, N, Kp);
+     if (S > 1) {
+         size_t need = (size_t)S * (size_t)M * N * sizeof(float);
+@@ -73,7 +73,13 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
+         int seg_floor = k_tiles / S, seg_rem = k_tiles % S;
+         size_t total = (size_t)M * N;
+         float* Dpart = static_cast<float*>(ws);
+-        if (tc.MT == 128) {
++        if (tc.MT == 128 && tc.NT == 128) {
++            dim3 g(M / 128, N / 128, S);
++            int lds = 2 * (128 * (KT * 6 / 8));
++            lds_gemm_hybrid_dripA<128, 128, KT, 2, 2, 1, 0, OutT, true>
++                <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
++                                  seg_floor, seg_rem, Dpart);
++        } else if (tc.MT == 128) {
+             dim3 g(M / 128, N / 256, S);
+             int lds = 2 * (128 * (KT * 6 / 8));
+             lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, true>
+@@ -91,7 +97,16 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
+         reduce_splitk<OutT><<<dim3((unsigned)red_blocks), dim3(threads)>>>(Dpart, dD, (long)total, S);
+         return;
+     }
+-    if (tc.MT == 128) {
++    if (tc.MT == 128 && tc.NT == 128) {
++        // 128x128 tile: large-K wide-N path — halve B working-set per WG to improve L2 residency.
++        // NB=6 (vs 12 for 128x256); shorter MFMA window but 2x more WGs cover the output.
++        // Tradeoff: less latency-hiding headroom but better cache reuse. Measurement decides.
++        dim3 g(M / 128, N / 128);
++        int lds = 2 * (128 * (KT * 6 / 8));
++        lds_gemm_hybrid_dripA<128, 128, KT, 2, 2, 1, 0, OutT, false>
++            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
++                              0, k_tiles, nullptr);
++    } else if (tc.MT == 128) {
+         // occ1. (The 8-acc 128x256 tile CAN be forced to occ2 via MIN_OCC=2 — 251 VGPR,
+         // 0 spill — but in STEADY STATE that gives ~0% on small-M: a 256-WG shape has no
+         // 2nd WG to fill the occ2 slot. An earlier +6~10% reading was a warm-up artifact
+@@ -110,5 +125,36 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
+     }
+ }
+ 
++// Like dispatch_gemm but uses a caller-supplied TileChoice instead of choose_tile(). No split-K.
++// Used by gemm_force_tile() to exercise a specific kernel path on small shapes for testing.
++template <typename OutT>
++inline void dispatch_gemm_force_tile(int M, int N, int Kp, TileChoice tc, const void* dA,
++                                     const void* dBsh, const uint8_t* dsA, const uint8_t* dsB,
++                                     OutT* dD, int A_row_bytes, int B_row_bytes) {
++    constexpr int KT = K_TILE;
++    dim3 blk(256);
++    int kit = Kp / 64;
++    int k_tiles = kit / (KT / 64);
++    if (tc.MT == 128 && tc.NT == 128) {
++        dim3 g(M / 128, N / 128);
++        int lds = 2 * (128 * (KT * 6 / 8));
++        lds_gemm_hybrid_dripA<128, 128, KT, 2, 2, 1, 0, OutT, false>
++            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
++                              0, k_tiles, nullptr);
++    } else if (tc.MT == 128) {
++        dim3 g(M / 128, N / 256);
++        int lds = 2 * (128 * (KT * 6 / 8));
++        lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, false>
++            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
++                              0, k_tiles, nullptr);
++    } else {
++        dim3 g(M / 256, N / 256);
++        int lds = 2 * (256 * (KT * 6 / 8));
++        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, 0, OutT, false>
++            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
++                              0, k_tiles, nullptr);
++    }
++}
++
+ }  // namespace detail
+ }  // namespace mxfp6
+diff --git a/src/gemm.cpp b/src/gemm.cpp
+index 4b02435..dcb3321 100644
+--- a/src/gemm.cpp
++++ b/src/gemm.cpp
+@@ -9,9 +9,22 @@
+ 
+ namespace mxfp6 {
+ 
+-TileChoice choose_tile(int M, int N) {
++TileChoice choose_tile(int M, int N, int Kp) {
+     constexpr int CU = 256;  // MI350X (gfx950)
+     int wg256 = (M / 256) * (N / 256);
++    // 128x128 path: large-K wide-N where the 128x256 tile's per-WG B working-set
++    // (256 cols * Kp * 0.75 B) exceeds L2, but halving NT to 128 may improve residency.
++    // Guard: shape must be 128x128-grid-valid AND Kp is known AND large enough.
++    // Threshold: Kp >= 32768 (= K > ~22K fp6-effective; chosen to activate at the
++    // 105728-padded shapes observed to be L2-miss dominated at N=6144).
++    constexpr int LARGEK_THRESH = 32768;
++    if (wg256 < CU && (M % 128) == 0 && (N % 128) == 0 && Kp >= LARGEK_THRESH) {
++        // Large-K wide-N: try 128x128 to halve B working-set per pass.
++        // Only when wg128 fills the CUs (halving NT doubles WGs).
++        int wg128 = (M / 128) * (N / 128);
++        if (wg128 >= CU)
++            return {128, 128, 2, 2};  // large-K wide-N: halve B working-set per WG
++    }
+     if (wg256 < CU && (M % 128) == 0 && (N % 256) == 0)
+         return {128, 256, 2, 4};  // WG-starved small-M: fill CUs
+     return {256, 256, 4, 4};      // workhorse: 16-acc sweet spot
+@@ -41,4 +54,24 @@ void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, co
+     }
+ }
+ 
++void gemm_force_tile(OutType ot, int M, int N, int Kp, TileChoice tc, const void* dA,
++                     const void* dBsh, const uint8_t* dsA, const uint8_t* dsB, void* dD,
++                     int A_row_bytes, int B_row_bytes) {
++    switch (ot) {
++        case OutType::F32:
++            detail::dispatch_gemm_force_tile<float>(M, N, Kp, tc, dA, dBsh, dsA, dsB,
++                                                    static_cast<float*>(dD), A_row_bytes, B_row_bytes);
++            break;
++        case OutType::F16:
++            detail::dispatch_gemm_force_tile<__half>(M, N, Kp, tc, dA, dBsh, dsA, dsB,
++                                                     static_cast<__half*>(dD), A_row_bytes, B_row_bytes);
++            break;
++        case OutType::BF16:
++            detail::dispatch_gemm_force_tile<__hip_bfloat16>(M, N, Kp, tc, dA, dBsh, dsA, dsB,
++                                                              static_cast<__hip_bfloat16*>(dD),
++                                                              A_row_bytes, B_row_bytes);
++            break;
++    }
++}
++
+ }  // namespace mxfp6
+diff --git a/tests/test_gemm.cpp b/tests/test_gemm.cpp
+index b8131e1..8ff4960 100644
+--- a/tests/test_gemm.cpp
++++ b/tests/test_gemm.cpp
+@@ -85,7 +85,8 @@ static void teardown(Dev& x) {
+ }
+ 
+ static bool verify(int M, int N, int K) {
+-    TileChoice tc = choose_tile(M, N);
++    int Kp_est = ((K + K_TILE - 1) / K_TILE) * K_TILE;
++    TileChoice tc = choose_tile(M, N, Kp_est);
+     Dev x = setup(M, N, K, tc);
+     std::vector<float> Dref((size_t)M * N);
+     mxfp6_gemm_ref(x.Aq, x.Bq, Dref.data(), M, x.Kp, N);
+@@ -116,8 +117,8 @@ static bool verify(int M, int N, int K) {
+ // scales kpad-extended with a non-NaN tail (pad_scales_k). Compared to the correct GEMM (a
+ // zero-Kp-padded A reference). Exercises the inter-row K-tail overlap nulled by B's zero tail.
+ static bool verify_compact(int M, int N, int K) {
+-    TileChoice tc = choose_tile(M, N);
+     int Kp = kpad(K);
++    TileChoice tc = choose_tile(M, N, Kp);
+     std::mt19937 rng(M * 5 + N * 11 + K * 2);
+     std::uniform_real_distribution<float> d(-1, 1);
+     std::vector<float> Areal((size_t)M * K), Bf((size_t)Kp * N, 0.f);
+@@ -182,8 +183,37 @@ static bool verify_compact(int M, int N, int K) {
+     hipFree(dD);
+     return ok;
+ }
++// Correctness check for the 128x128 kernel path on SMALL shapes (fast CPU ref, ~5e7 MACs).
++// Forces MPW=2/NPW=2 scale tiling and calls gemm_force_tile() to bypass choose_tile() routing,
++// so the 128x128 kernel is exercised even when Kp < the large-K threshold. M must be a multiple
++// of 128; N must be a multiple of 128.
++static bool verify_128x128(int M, int N, int K) {
++    constexpr TileChoice tc = {128, 128, 2, 2};
++    Dev x = setup(M, N, K, tc);
++    std::vector<float> Dref((size_t)M * N);
++    mxfp6_gemm_ref(x.Aq, x.Bq, Dref.data(), M, x.Kp, N);
++    float* dD;
++    hipMalloc(&dD, (size_t)M * N * 4);
++    hipMemset(dD, 0x5A, (size_t)M * N * 4);
++    gemm_force_tile(OutType::F32, M, N, x.Kp, tc, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br);
++    hipDeviceSynchronize();
++    std::vector<float> Dg((size_t)M * N);
++    hipMemcpy(Dg.data(), dD, (size_t)M * N * 4, hipMemcpyDeviceToHost);
++    hipFree(dD);
++    float er = 0, mx = 0;
++    for (size_t i = 0; i < (size_t)M * N; i++) {
++        er = fmaxf(er, fabsf(Dg[i] - Dref[i]));
++        mx = fmaxf(mx, fabsf(Dref[i]));
++    }
++    bool ok = er < 2e-2f * fmaxf(1.f, mx);
++    printf("  128x128 %4dx%4dx%4d : %s\n", M, N, K, ok ? "OK" : "FAIL<<<");
++    teardown(x);
++    return ok;
++}
++
+ static void perf(int M, int N, int K) {
+-    TileChoice tc = choose_tile(M, N);
++    int Kp_est = ((K + K_TILE - 1) / K_TILE) * K_TILE;
++    TileChoice tc = choose_tile(M, N, Kp_est);
+     Dev x = setup(M, N, K, tc);
+     __half* dD;
+     hipMalloc(&dD, (size_t)M * N * 2);
+@@ -195,7 +225,7 @@ static void perf(int M, int N, int K) {
+         gemm(OutType::F16, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb);
+     };
+     double ms = bench(run);
+-    int base_wg = (M / tc.MT) * (N / 256);
++    int base_wg = (M / tc.MT) * (N / tc.NT);
+     int S = wsb ? (int)(wsb / ((size_t)M * N * sizeof(float))) : 1;  // S from workspace size
+     int wg = base_wg * S;
+     printf("  %5dx%5dx%5d wg=%4d S=%d -> %3dx%3d : %.0f TFLOPs\n", M, N, K, wg, S, tc.MT, tc.NT,
+@@ -204,7 +234,12 @@ static void perf(int M, int N, int K) {
+     hipFree(dD);
+     teardown(x);
+ }
+-int main() {
++int main(int argc, char** argv) {
++    if (argc >= 4) {
++        int M = atoi(argv[1]), N = atoi(argv[2]), K = atoi(argv[3]);
++        perf(M, N, K);
++        return 0;
++    }
+     printf("=== libmxfp6gemm correctness (end-to-end, CPU ref) ===\n");
+     int f = 0;
+     f += !verify(512, 512, 768);    // -> 128x256 path (wg256<CU)
+@@ -219,6 +254,10 @@ int main() {
+     f += !verify_compact(2048, 1024, 3808);   // -> split-K (S=2) WITH real K-tail: K%192=160,
+                                               //    k_tiles=20, last segment includes the pad tile
+     f += !verify_compact(2048, 1024, 6304);
++    // 128x128 kernel path: forced via gemm_force_tile() on small shapes (fast CPU ref ~5e7 MACs).
++    // 256x256x768: grid 2x2 WGs, k_tiles=4. 384x512x1536: grid 3x4 WGs, k_tiles=8.
++    f += !verify_128x128(256, 256, 768);
++    f += !verify_128x128(384, 512, 1536);
+     if (f) {
+         printf("  CORRECTNESS FAILED\n");
+         return 1;
+@@ -228,7 +267,8 @@ int main() {
+     int sh[][3] = {{2048, 1024, 12288},   // tier-1: narrow N + large K
+                    {2048, 1024, 16128},   // tier-1: narrow N + larger K
+                    {2048, 1024, 105728},
+-                   {2048, 6144, 16128}};  // control: wide N, same K (record speedup 0.886)
++                   {2048, 6144, 16128},   // control: wide N, same K (128x256 path, Kp<32768)
++                   {2048, 6144, 105728}}; // wide N + large K: 128x128 candidate
+     for (auto& s : sh) perf(s[0], s[1], s[2]);
+     return 0;
+ }

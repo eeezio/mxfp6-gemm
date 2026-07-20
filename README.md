@@ -49,6 +49,39 @@ Split-K is enabled inside `gemm()` for workgroup-starved shapes when you supply 
 (sized via `gemm_workspace_size`, see below); shapes that already fill the CUs (e.g. wide N) skip it
 and need no workspace.
 
+### Wide-N large-K shapes (128×128 tile)
+
+Wide-N shapes fill the CUs (so split-K does not apply), but at very large K the B working set per
+N-slice overflows L2 and throughput sags — the direct-B ring is left exposed to HBM latency. Routing
+these to a **128×128 tile** halves the B working set per workgroup and restores L2 residency (see
+[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) §9). Measured on **MI350X** (the primary gfx950
+target, `10.7.191.60`), ours + CK in one session, FP16, `2048 × 6144`:
+
+| M × N × K | CK MXFP8 | before (128×256) | after (128×128) | speedup | after vs CK |
+|---|---:|---:|---:|---:|---:|
+| 2048 × 6144 × 512    | 467  | 716  | 715  | — | 1.53× |
+| 2048 × 6144 × 4096   | 1195 | 1283 | 1332 | — | 1.11× |
+| 2048 × 6144 × 16128  | 1550 | 1588 | 1581 (unchanged, stays 128×256) | — | 1.02× |
+| 2048 × 6144 × 105728 | 1413 | 1260 | **1509** | **1.20×** | **1.07×** (was 0.89×) |
+
+Auto-selected in `choose_tile` only when the cache (not the CU count) is the binding constraint;
+all other shapes are byte-for-byte unchanged.
+
+Cross-checked on **MI355X** (reference node `smci355-ccs-aus-n03-05`, higher-clocked; ours + CK in
+one session, same shapes) — the same fix, with more headroom. (Baseline 1318 and CK 1523 reproduce
+the original reference measurement on this node exactly.)
+
+| M × N × K | CK MXFP8 | ours before | ours after (128×128) | after vs CK |
+|---|---:|---:|---:|---:|
+| 2048 × 6144 × 512    | 505  | 772  | 774  | 1.53× |
+| 2048 × 6144 × 4096   | 1397 | 1509 | 1532 | 1.10× |
+| 2048 × 6144 × 16128  | 1780 | 1771 | 1770 | 0.99× |
+| 2048 × 6144 × 105728 | 1523 | 1318 | **1811** | **1.19×** (was 0.87×) |
+
+The K=105728 fix flips the result from a loss to a win on both GPUs (MI350X 0.89×→1.07×, MI355X
+0.87×→1.19×), with every other shape staying ≥ CK. Full per-track / per-machine data:
+[`prof_results/experiments-2026-07-16/EXPERIMENT-LOG.md`](prof_results/experiments-2026-07-16/EXPERIMENT-LOG.md).
+
 ---
 
 ## Build

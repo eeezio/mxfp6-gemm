@@ -56,7 +56,10 @@ bursted all at once after the barrier.
 ### 3.2 B: bypass LDS, read HBM → VGPR directly (register prefetch ring)
 
 **What**: B never enters LDS; it streams straight from HBM into VGPRs through a compile-time
-register ring (`PFD=5`). B is first laid out coalesced by `preshuffle_B`.
+register ring (`PFD=5`, deepest that keeps spill=0). B is first laid out coalesced by
+`preshuffle_B`. For the residual 128×256 shapes at very large K (`Kp>50000`, where the 256-col
+B/N-slice exceeds L2), the ring is K-gated one step deeper (`PFD=7`, still spill-free) to cover
+more of the HBM-miss latency — worth ~2–3% there, while `PFD=5` stays best in the L2-hit regime.
 
 **Why**: LDS is a limited resource and is already fully taken by A's deep-K double buffer; B, with
 low in-loop reuse and large volume, is a poor fit for LDS reuse anyway — staging it would only
@@ -106,17 +109,19 @@ load fetch all of a wave's scales for an entire K_TILE — minimizing the number
 
 ## 6. Shape routing: two-tile dispatch
 
-**What**: `choose_tile(M,N)` selects between two tiles with a simple threshold — when the 256×256
-workgroup count (`(M/256)*(N/256)`) is below the CU count (256) and `M%128==0 && N%256==0`, it
-picks the small tile; otherwise the large tile:
+**What**: `choose_tile(M,N,Kp)` selects between three tiles:
 - **256×256** (16 acc) — the workhorse for CU-filling shapes (default).
 - **128×256** (8 acc) — small-M, WG-starved shapes, where a smaller tile spawns more workgroups to
-  fill the CUs.
+  fill the CUs (`(M/256)*(N/256) < CU && M%128==0 && N%256==0`).
+- **128×128** (4 acc) — large-K wide-N shapes where B's per-N-slice working set overflows L2
+  (`(M/256)*(N/256) < CU && Kp≥32768 && (M/128)*(N/128) ≥ CU`). Halving the N-tile halves the
+  B working set streamed per workgroup, restoring L2 residency (see §9).
 
 **Why**: At occ1, a large tile on small shapes leaves the grid with fewer workgroups than CUs,
 idling half the machine. The small-M path raises the workgroup count with a smaller tile to fill
 the CUs, while **reusing the entire hybrid machinery** (drip-A, B-direct, swapped-C) — only the
-tile template parameters change; no new kernel is introduced.
+tile template parameters change; no new kernel is introduced. The 128×128 path is the same
+machinery again, chosen only when the *cache*, not the CU count, is the binding constraint (§9).
 
 ---
 
@@ -187,3 +192,43 @@ split iff   Kp * (S - W)  >  ALPHA * base_wg * S²      (ALPHA = 10, gfx950)
 margin `Kp·(S−W)/(S²·base_wg) ≈ 8–10`, conservatively 10). Validated: it drops the `2048×2048×3490`
 (→ `S=1`, 905) and `N=3072` (→ `S=1`, 1408) regressions, **keeps** the deep-K `S=2` win
 `2048×1024×3490` (524 vs 503), and leaves every `S=4` win unchanged. See `benchmark_results.md`.
+
+---
+
+## 9. Large-K wide-N: the L2-capacity wall (working-set reduction, not latency-hiding)
+
+**Symptom**: on wide-N shapes that already fill the CUs along M/N (so split-K does not apply),
+throughput *peaks* at moderate K and then *drops* at very large K. Measured on **MI350X** (the
+primary gfx950 target), `2048×6144×K` (FP16): `K=16128 → 1588`, `K=105728 → 1260` TFLOPS — a 21%
+fall, and CK's mxfp8 (`1413`) overtakes us there. (Same pattern on MI355X: `1799 → 1323`.)
+
+**Root cause** (ATT-confirmed on the MI355X reference node, see the wiki case study): B is streamed
+HBM→VGPR (§3.2) and each 128×256 workgroup streams its `256 × K × 0.75`-byte B/N-slice. That slice
+is shared across the M-row workgroups of an N-slice, so it *wants* to live in L2:
+- `K=16128` → 3.1 MB/N-slice → fits L2 → `buffer_load` avg stall ≈ 257 cyc.
+- `K=105728` → 20.3 MB/N-slice → overflows L2 → every tile re-fetches from HBM → stall ≈ **2538
+  cyc** (≈10×). The `PFD=5` ring covers only ~250 cyc, so the latency is exposed.
+
+**The fix — halve the working set (§6, 128×128 tile)**: routing large-K wide-N to a 128×128 tile
+halves the B/N-slice per workgroup (20.3 → 10.2 MB), which restores L2 residency. Measured **MI350X**
+`2048×6144×105728`: **1260 → 1509 TFLOPS (+19.8%)**, now **1.07× CK** — the large-K penalty is
+essentially gone. Cross-checked on the **MI355X** reference node (higher-clocked): **1318 → 1811
+(+37%), 1.19× CK**. The cost (a shorter MFMA window, NB=6 vs 12, and 2× the workgroups) is far
+outweighed by the cache win. Guarded so it triggers *only* when the cache, not the CU count, is the
+binding constraint; all other shapes are byte-for-byte unchanged.
+
+**Why not latency-hiding?** Two latency-oriented attempts were built and measured, and both *lost* —
+which is the load-bearing lesson here:
+- **B staged through an LDS double-buffer** (mirror of A's deep-K path, `issue_B_chunks` dripped
+  across the MFMA window, one `wait_vmcnt(0)`/tile): correct (er=0.0000) but **1215 TFLOPS, −8%**.
+  A single tile of look-ahead (~384 cyc of compute) cannot cover 2538 cyc of HBM latency, and the
+  added ds-read traffic roughly cancels the partial gain. Staging through LDS hides latency but does
+  **not reduce HBM bytes** — and at this shape the bottleneck is bytes/bandwidth, not latency.
+- **Cross-tile B prefetch (BXPRE)** — issuing next-tile B loads at the tail of the current tile:
+  ISA analysis showed it cannot help, because the hardware VMCNT is a single shared counter, so the
+  `wait_vmcnt(0)` that guards the A double-buffer barrier necessarily drains the cross-tile B loads
+  too (an earlier build measured −25%). No inline-asm trick escapes a shared counter.
+
+**Takeaway**: latency-hiding is the right tool when latency is the bottleneck; **working-set
+reduction is the right tool when bandwidth/cache-capacity is**. At large K on a wide tile the
+kernel is capacity-bound, so shrinking B/N-slice beats every attempt to hide its latency.
