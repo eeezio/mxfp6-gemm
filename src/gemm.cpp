@@ -54,6 +54,10 @@ void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, co
     }
 }
 
+// UNSAFE test-only helper: bypasses choose_tile() routing to force a specific tile path on small
+// shapes. Intentionally NOT declared in the public header (mxfp6/gemm.hpp) — tests/test_gemm.cpp
+// forward-declares it. Caller must keep tc / scale-tiling / M%MT / N%NT in sync (mismatch = silent
+// wrong output). No split-K.
 void gemm_force_tile(OutType ot, int M, int N, int Kp, TileChoice tc, const void* dA,
                      const void* dBsh, const uint8_t* dsA, const uint8_t* dsB, void* dD,
                      int A_row_bytes, int B_row_bytes) {

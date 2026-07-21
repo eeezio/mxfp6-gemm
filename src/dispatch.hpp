@@ -9,7 +9,8 @@
 // coalesced HBM->VGPR ring + dripped A loads + RDB barrier + tiled-scale), routed by shape:
 //   * 256x256 (16-acc sweet spot) — workhorse for CU-filling shapes.
 //   * 128x256 (8-acc)             — WG-starved small-M, to fill idle CUs.
-// Same lds_gemm_hybrid_dripA kernel for both (tile-general); only the tile args differ.
+//   * 128x128 (4-acc)             — large-K wide-N, shrinks B working set to fit L2.
+// Same lds_gemm_hybrid_dripA kernel for all (tile-general); only the tile args differ.
 #include "kernel.hpp"
 #include "mxfp6/gemm.hpp"  // TileChoice, choose_tile (declarations)
 namespace mxfp6 {
@@ -73,13 +74,10 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
         int seg_floor = k_tiles / S, seg_rem = k_tiles % S;
         size_t total = (size_t)M * N;
         float* Dpart = static_cast<float*>(ws);
-        if (tc.MT == 128 && tc.NT == 128) {
-            dim3 g(M / 128, N / 128, S);
-            int lds = 2 * (128 * (KT * 6 / 8));
-            lds_gemm_hybrid_dripA<128, 128, KT, 2, 2, 1, 0, OutT, true>
-                <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
-                                  seg_floor, seg_rem, Dpart);
-        } else if (tc.MT == 128) {
+        // Note: the 128x128 tile never reaches the split path — it is chosen only when wg128>=CU
+        // (see choose_tile), which makes base_wg>=CU, so splitk_S() returns S=1. Only the 128x256
+        // and 256x256 tiles can be WG-starved enough to split along K.
+        if (tc.MT == 128) {
             dim3 g(M / 128, N / 256, S);
             int lds = 2 * (128 * (KT * 6 / 8));
             lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, true>

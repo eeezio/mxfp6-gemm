@@ -17,6 +17,17 @@
 using namespace mxfp6;
 static constexpr int KT = K_TILE;
 
+// gemm_force_tile(): UNSAFE test-only helper (bypasses choose_tile routing; the caller must keep
+// TileChoice / scale-tiling / shape divisibility in sync — a mismatch is silent wrong output). It
+// is intentionally NOT part of the public API (not declared in mxfp6/gemm.hpp); forward-declared
+// here so only the test can reach the library symbol. Used to exercise the 128x128 path on small
+// shapes where choose_tile would route elsewhere.
+namespace mxfp6 {
+void gemm_force_tile(OutType ot, int M, int N, int Kp, TileChoice tc, const void* dA,
+                     const void* dBsh, const uint8_t* dsA, const uint8_t* dsB, void* dD,
+                     int A_row_bytes, int B_row_bytes);
+}  // namespace mxfp6
+
 template <class F>
 static double bench(F run) {
     for (int i = 0; i < 8; i++) run();
