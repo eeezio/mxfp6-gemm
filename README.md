@@ -49,6 +49,39 @@ Split-K is enabled inside `gemm()` for workgroup-starved shapes when you supply 
 (sized via `gemm_workspace_size`, see below); shapes that already fill the CUs (e.g. wide N) skip it
 and need no workspace.
 
+### Wide-N large-K shapes (128×128 tile)
+
+Wide-N shapes fill the CUs (so split-K does not apply), but at very large K the B working set per
+N-slice overflows L2 and throughput sags — the direct-B ring is left exposed to HBM latency. Routing
+these to a **128×128 tile** halves the B working set per workgroup and restores L2 residency (see
+[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) §9). Measured on **MI350X** (the primary gfx950
+target, `10.7.191.60`), ours + CK in one session, FP16, `2048 × 6144`:
+
+| M × N × K | CK MXFP8 | before (128×256) | after (128×128) | speedup | after vs CK |
+|---|---:|---:|---:|---:|---:|
+| 2048 × 6144 × 512    | 467  | 716  | 715  | — | 1.53× |
+| 2048 × 6144 × 4096   | 1195 | 1283 | 1332 | — | 1.11× |
+| 2048 × 6144 × 16128  | 1550 | 1588 | 1581 (unchanged, stays 128×256) | — | 1.02× |
+| 2048 × 6144 × 105728 | 1413 | 1260 | **1509** | **1.20×** | **1.07×** (was 0.89×) |
+
+Auto-selected in `choose_tile` only when the cache (not the CU count) is the binding constraint;
+all other shapes are byte-for-byte unchanged.
+
+Cross-checked on **MI355X** (reference node `smci355-ccs-aus-n03-05`, higher-clocked; ours + CK in
+one session, same shapes) — the same fix, with more headroom. (Baseline 1318 and CK 1523 reproduce
+the original reference measurement on this node exactly.)
+
+| M × N × K | CK MXFP8 | ours before | ours after (128×128) | after vs CK |
+|---|---:|---:|---:|---:|
+| 2048 × 6144 × 512    | 505  | 772  | 774  | 1.53× |
+| 2048 × 6144 × 4096   | 1397 | 1509 | 1532 | 1.10× |
+| 2048 × 6144 × 16128  | 1780 | 1771 | 1770 | 0.99× |
+| 2048 × 6144 × 105728 | 1523 | 1318 | **1811** | **1.19×** (was 0.87×) |
+
+The K=105728 fix flips the result from a loss to a win on both GPUs (MI350X 0.89×→1.07×, MI355X
+0.87×→1.19×), with every other shape staying ≥ CK. Full per-track / per-machine data:
+[`prof_results/experiments-2026-07-16/EXPERIMENT-LOG.md`](prof_results/experiments-2026-07-16/EXPERIMENT-LOG.md).
+
 ---
 
 ## Build
@@ -98,8 +131,10 @@ using namespace mxfp6;
 // M and N must be multiples of 256; K a multiple of 32 (see Requirements).
 int M = 8192, N = 8192, K = 8192;
 
-TileChoice tc = choose_tile(M, N);   // picks the tile + scale grouping for this shape
-int Kp = kpad(K);                    // pad K up to a multiple of K_TILE (=192); here 8256
+int Kp = kpad(K);                        // pad K up to a multiple of K_TILE (=192); here 8256
+TileChoice tc = choose_tile(M, N, Kp);   // picks the tile + scale grouping for this shape
+                                         // (Kp is required: tile choice is K-aware — pass the SAME
+                                         //  Kp you pass to gemm(), or the scale grouping won't match)
 
 // --- 1. quantize (host) ---
 // A: quantized in its NATURAL COMPACT K layout — no per-row padding, A_f32 is just M*K floats.
@@ -157,7 +192,7 @@ per-row — only `a_compact_end_pad(K)` bytes are added at the very end of the w
 | `constexpr int K_TILE` (=192) | The kernel's K-tile depth. K is padded to a multiple of it. |
 | `int kpad(int K)` | K rounded up to a multiple of `K_TILE` → pass as the kernel's `Kp`. |
 | `struct TileChoice { int MT, NT, MPW, NPW; }` | Tile (MT×NT) + per-wave 32-block counts (MPW/NPW) for scale grouping. |
-| `TileChoice choose_tile(int M, int N)` | Pick the tile/scale grouping for a shape. **Use its `MPW`/`NPW` for `tile_scale`.** |
+| `TileChoice choose_tile(int M, int N, int Kp)` | Pick the tile/scale grouping for a shape. **Use its `MPW`/`NPW` for `tile_scale`.** `Kp` is required and must be the same padded `Kp` passed to `gemm()` (tile choice is K-aware). |
 | `size_t gemm_workspace_size(int M, int N, int Kp)` | Bytes of split-K scratch to allocate for this shape; **0** if it doesn't split. |
 | `void gemm(OutType, M, N, Kp, dA, dBsh, dsA, dsB, dD, A_row_bytes, B_row_bytes, ws, ws_bytes)` | Launch. All `d*`/`ws` are device pointers. `ws`/`ws_bytes` = split-K scratch (`gemm_workspace_size`); `(nullptr,0)` never splits. |
 
@@ -217,8 +252,10 @@ gives a safe scale tail automatically). Same result, but A is padded per-row.
   so a non-divisible M/N silently drops the remainder rows/cols.
 - **B is transposed by `preprocess_B`.** Pass B in its natural `[K][N]` row-major layout; the
   helper produces `Bᵀ[N][K]` and quantizes it.
-- **Scale grouping must match the tile.** Use `choose_tile(M,N).MPW` for A's `tile_scale` and
-  `.NPW` for B's. Mismatched grouping gives wrong results.
+- **Scale grouping must match the tile.** Use `choose_tile(M,N,Kp).MPW` for A's `tile_scale` and
+  `.NPW` for B's, passing the **same padded `Kp` you pass to `gemm()`** — tile choice is K-aware
+  (large-K wide-N routes to 128×128 with different MPW/NPW), so a different `Kp` here silently
+  tiles the scales for the wrong kernel. Mismatched grouping gives wrong results.
 - **`A_row_bytes` / `B_row_bytes`** are the packed bytes per row (= `Quantized.packed_row_bytes`).
   For compact A this is `packed(K)`; for per-row-padded A it is `packed(Kp)`.
 - **E8M0 scale `0xFF` is NaN** and will poison the **entire** output (`0·NaN = NaN`). This is the
@@ -265,7 +302,7 @@ template <int M_TILE, int N_TILE, int K_TILE, int WAVES_M, int WAVES_N, int MIN_
 
 | Param | Default | Meaning |
 |---|---|---|
-| `M_TILE` × `N_TILE` | 256×256 / 128×256 | Register accumulator tile per workgroup. Larger ⇒ higher arithmetic intensity (AI) but fewer workgroups. The live shape knob (`choose_tile`): 256×256 for CU-filling shapes, 128×256 for WG-starved small-M. |
+| `M_TILE` × `N_TILE` | 256×256 / 128×256 / 128×128 | Register accumulator tile per workgroup. Larger ⇒ higher arithmetic intensity (AI) but fewer workgroups. The live shape knob (`choose_tile`): 256×256 for CU-filling shapes, 128×256 for WG-starved small-M, 128×128 for large-K wide-N (shrinks B working set to fit L2). |
 | `K_TILE` | 192 | Deep-K tile depth = size of the MFMA window backing one load. Bigger window hides load latency. `subs = K_TILE/64`. |
 | `WAVES_M` × `WAVES_N` | 2×2 | How the tile is split across the block's 4 waves → per-wave block shape `MPW×NPW` = `(M_TILE/32/WAVES_M)×(N_TILE/32/WAVES_N)`. Sets the load-vs-MFMA ratio (perimeter vs area) and input VGPR. |
 | `MIN_OCC` | 1 | Occupancy floor (`__launch_bounds__` 2nd arg). occ1 holds the largest tile; occ2 forces a smaller AI (see coupling). |

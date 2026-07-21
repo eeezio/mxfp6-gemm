@@ -1,0 +1,12 @@
+# Authoritative rebuild — smci355-ccs-aus-n03-05 (MI355X reference node, = 10.235.26.75)
+# 2026-07-20, ROCm 7.0.2 container, HIP_VISIBLE_DEVICES=0, same GPU session. 2048x6144xK, FP16.
+# Correctness (integrated): full suite all OK incl. 128x128 256x256x768 & 384x512x1536.
+#
+# K        ours_baseline  ours_integrated  CK_mxfp8   integrated/CK
+# 512      772            774              504.86     1.53x
+# 4096     1509           1532             1397.48    1.10x
+# 16128    1771           1770             1780.44    0.99x (tied; unchanged 128x256 path)
+# 105728   1318           1811             1522.78    1.19x   (baseline 0.87x -> 1.19x, +37.4%)
+#
+# The K=105728 win is delivered by the 128x128 tile (choose_tile routes it: wg256=192<CU,
+# Kp>=32768, wg128=768>=CU). Baseline 1318 and CK 1523 reproduce the original reference exactly.

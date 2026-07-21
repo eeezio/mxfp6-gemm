@@ -9,9 +9,22 @@
 
 namespace mxfp6 {
 
-TileChoice choose_tile(int M, int N) {
+TileChoice choose_tile(int M, int N, int Kp) {
     constexpr int CU = 256;  // MI350X (gfx950)
     int wg256 = (M / 256) * (N / 256);
+    // 128x128 path: large-K wide-N where the 128x256 tile's per-WG B working-set
+    // (256 cols * Kp * 0.75 B) exceeds L2, but halving NT to 128 may improve residency.
+    // Guard: shape must be 128x128-grid-valid AND Kp is known AND large enough.
+    // Threshold: Kp >= 32768 (= K > ~22K fp6-effective; chosen to activate at the
+    // 105728-padded shapes observed to be L2-miss dominated at N=6144).
+    constexpr int LARGEK_THRESH = 32768;
+    if (wg256 < CU && (M % 128) == 0 && (N % 128) == 0 && Kp >= LARGEK_THRESH) {
+        // Large-K wide-N: try 128x128 to halve B working-set per pass.
+        // Only when wg128 fills the CUs (halving NT doubles WGs).
+        int wg128 = (M / 128) * (N / 128);
+        if (wg128 >= CU)
+            return {128, 128, 2, 2};  // large-K wide-N: halve B working-set per WG
+    }
     if (wg256 < CU && (M % 128) == 0 && (N % 256) == 0)
         return {128, 256, 2, 4};  // WG-starved small-M: fill CUs
     return {256, 256, 4, 4};      // workhorse: 16-acc sweet spot
@@ -37,6 +50,30 @@ void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, co
             detail::dispatch_gemm<__hip_bfloat16>(M, N, Kp, dA, dBsh, dsA, dsB,
                                                   static_cast<__hip_bfloat16*>(dD), A_row_bytes,
                                                   B_row_bytes, ws, ws_bytes);
+            break;
+    }
+}
+
+// UNSAFE test-only helper: bypasses choose_tile() routing to force a specific tile path on small
+// shapes. Intentionally NOT declared in the public header (mxfp6/gemm.hpp) — tests/test_gemm.cpp
+// forward-declares it. Caller must keep tc / scale-tiling / M%MT / N%NT in sync (mismatch = silent
+// wrong output). No split-K.
+void gemm_force_tile(OutType ot, int M, int N, int Kp, TileChoice tc, const void* dA,
+                     const void* dBsh, const uint8_t* dsA, const uint8_t* dsB, void* dD,
+                     int A_row_bytes, int B_row_bytes) {
+    switch (ot) {
+        case OutType::F32:
+            detail::dispatch_gemm_force_tile<float>(M, N, Kp, tc, dA, dBsh, dsA, dsB,
+                                                    static_cast<float*>(dD), A_row_bytes, B_row_bytes);
+            break;
+        case OutType::F16:
+            detail::dispatch_gemm_force_tile<__half>(M, N, Kp, tc, dA, dBsh, dsA, dsB,
+                                                     static_cast<__half*>(dD), A_row_bytes, B_row_bytes);
+            break;
+        case OutType::BF16:
+            detail::dispatch_gemm_force_tile<__hip_bfloat16>(M, N, Kp, tc, dA, dBsh, dsA, dsB,
+                                                              static_cast<__hip_bfloat16*>(dD),
+                                                              A_row_bytes, B_row_bytes);
             break;
     }
 }

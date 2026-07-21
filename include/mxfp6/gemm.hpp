@@ -5,12 +5,13 @@
 // coalesced HBM->VGPR ring + dripped A loads + RDB barrier + tiled-scale), shape-routed:
 //   * 256x256 tile (16-acc) for shapes whose grid fills the machine (WG >= #CU)
 //   * 128x256 tile (8-acc)  for WG-starved small-M shapes (fills idle CUs)
+//   * 128x128 tile (4-acc)  for large-K wide-N shapes (shrinks B working set to fit L2)
 //
 // This header is device-free (plain declarations) — a host translation unit can include it
 // and link libmxfp6gemm without a HIP compiler. Inputs are pre-quantized DEVICE buffers:
 // quantize A / preprocess+preshuffle B / tile the scales with mxfp6/preprocess.hpp first,
-// using choose_tile(M,N).{MPW,NPW} for the scale grouping. Kp = K padded up to a multiple
-// of the K-tile (192).
+// using choose_tile(M,N,Kp).{MPW,NPW} for the scale grouping — pass the SAME padded Kp you
+// pass to gemm() (see choose_tile below). Kp = K padded up to a multiple of the K-tile (192).
 #include <cstddef>
 #include <cstdint>
 
@@ -26,12 +27,17 @@ inline int kpad(int K) {
     return (K + K_TILE - 1) / K_TILE * K_TILE;
 }
 
-// Tile chosen for (M,N). MPW/NPW = per-wave 32-block counts (2x2 waves); the host scale
-// tiling (tile_scale) must use these for A and B respectively.
+// Tile chosen for (M,N,Kp). MPW/NPW = per-wave 32-block counts (2x2 waves); the host scale
+// tiling (tile_scale) MUST use these for A and B respectively.
+// Kp is REQUIRED (no default) and must be the same padded Kp (= kpad(K)) you pass to gemm():
+// tile selection is K-aware — large-K wide-N shapes route to the 128x128 tile, which uses a
+// different MPW/NPW than the 128x256 tile. Preprocessing the scales with a different Kp than
+// gemm() sees would tile them for the wrong kernel and silently corrupt the output, so the
+// Kp-consistency is enforced at compile time (there is intentionally no M/N-only overload).
 struct TileChoice {
     int MT, NT, MPW, NPW;
 };
-TileChoice choose_tile(int M, int N);
+TileChoice choose_tile(int M, int N, int Kp);
 
 // Bytes of split-K workspace required for (M, N, Kp) — pass the same Kp you pass to gemm().
 // Returns 0 for shapes that don't split (most shapes); for WG-starved narrow-N/large-K shapes it
