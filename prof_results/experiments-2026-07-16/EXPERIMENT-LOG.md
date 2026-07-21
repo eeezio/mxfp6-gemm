@@ -93,6 +93,11 @@ MI355X **0.87×→1.17×** — and every other shape stays ≥ CK (1.02×–1.53
 
 ## Per-track summary
 
+> The `track*.patch` files and `track4-blds-newfiles/` referenced below are **not committed to this
+> repo** — the unshipped/duplicate experiment code was dropped from the PR to keep the tree clean and
+> is preserved in a local research archive only. The shipped code lives in the normal source tree
+> (`src/`, `include/`).
+
 **T1 — PFD ring-depth K-gate.** Deeper B-ring (PFD=5→7, spill-free) covers more HBM-miss latency
 at very large K but costs ~1-2% in the L2-hit regime → gated on `Kp>50000` for the 128×256 path.
 +2.6–3.1% at K=105728, zero regression. Kept as a complement (mostly subsumed by T3). **Shipped.**
@@ -131,23 +136,18 @@ deeper ring). Diagnose `working_set vs L2` before reaching for LDS/prefetch.
 ---
 
 ## File manifest (this directory)
-- `EXPERIMENT-LOG.md` — this file.
-- `track2-asm-bxpre.patch` — BXPRE reference code (not shipped; ISA-nonviable).
-- `track3-128x128.patch` — the winning fix, isolated (vs HEAD).
-- `track4-b-via-lds.patch` — B-via-LDS edits to existing files (not shipped; negative result).
-- `track4-blds-newfiles/` — B-via-LDS new source files (`kernel_blds.hpp`, `dispatch_blds128.hpp`, `test_gemm128.cpp`).
-- `track5-integrated-shipped.patch` — the shipped tree (code + docs) vs HEAD.
+- `EXPERIMENT-LOG.md` — this file (the only committed artifact in this directory).
 
-Live worktrees (also retained on disk, per the preserve request):
-- T2: `.claude/worktrees/agent-aa2a146967487a686`
-- T3: `.claude/worktrees/agent-ad6420e278c4f061f`
-- T4: `.claude/worktrees/agent-a5f2cd65ccf799bb5`
+The per-track diffs (`track2-asm-bxpre.patch`, `track3-128x128.patch`, `track4-b-via-lds.patch`,
+`track4-blds-newfiles/`, `track5-integrated-shipped.patch`) and the experiment worktrees are kept in
+a **local research archive only** — they were removed from the PR to keep the tree clean, being
+either unshipped dead-ends (T2/T4) or duplicates of the shipped source (T3/T5, now live in `src/`).
 
 ## Reproduce
 ```bash
 # build (ck_arliu 7.0.2)
 docker exec ck_arliu bash -lc 'cd /workspace/mxfp6-gemm && cmake -S . -B build -DCMAKE_HIP_ARCHITECTURES=gfx950 && cmake --build build -j'
-# apply a track patch onto clean HEAD:  git apply prof_results/experiments-2026-07-16/track3-128x128.patch
+# (the shipped 128x128 fix is already in the source tree — no patch to apply)
 # run (ROCm 7.0.2 container on a gfx950 node, GPU pinned):
 docker run --rm --privileged -e HIP_VISIBLE_DEVICES=0 -v $HOME:/home/arliu --device=/dev/kfd --device=/dev/dri \
   --ipc=host --group-add video rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.13_pytorch_release_2.9.1 \

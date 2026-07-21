@@ -131,8 +131,10 @@ using namespace mxfp6;
 // M and N must be multiples of 256; K a multiple of 32 (see Requirements).
 int M = 8192, N = 8192, K = 8192;
 
-TileChoice tc = choose_tile(M, N);   // picks the tile + scale grouping for this shape
-int Kp = kpad(K);                    // pad K up to a multiple of K_TILE (=192); here 8256
+int Kp = kpad(K);                        // pad K up to a multiple of K_TILE (=192); here 8256
+TileChoice tc = choose_tile(M, N, Kp);   // picks the tile + scale grouping for this shape
+                                         // (Kp is required: tile choice is K-aware — pass the SAME
+                                         //  Kp you pass to gemm(), or the scale grouping won't match)
 
 // --- 1. quantize (host) ---
 // A: quantized in its NATURAL COMPACT K layout — no per-row padding, A_f32 is just M*K floats.
@@ -190,7 +192,7 @@ per-row — only `a_compact_end_pad(K)` bytes are added at the very end of the w
 | `constexpr int K_TILE` (=192) | The kernel's K-tile depth. K is padded to a multiple of it. |
 | `int kpad(int K)` | K rounded up to a multiple of `K_TILE` → pass as the kernel's `Kp`. |
 | `struct TileChoice { int MT, NT, MPW, NPW; }` | Tile (MT×NT) + per-wave 32-block counts (MPW/NPW) for scale grouping. |
-| `TileChoice choose_tile(int M, int N)` | Pick the tile/scale grouping for a shape. **Use its `MPW`/`NPW` for `tile_scale`.** |
+| `TileChoice choose_tile(int M, int N, int Kp)` | Pick the tile/scale grouping for a shape. **Use its `MPW`/`NPW` for `tile_scale`.** `Kp` is required and must be the same padded `Kp` passed to `gemm()` (tile choice is K-aware). |
 | `size_t gemm_workspace_size(int M, int N, int Kp)` | Bytes of split-K scratch to allocate for this shape; **0** if it doesn't split. |
 | `void gemm(OutType, M, N, Kp, dA, dBsh, dsA, dsB, dD, A_row_bytes, B_row_bytes, ws, ws_bytes)` | Launch. All `d*`/`ws` are device pointers. `ws`/`ws_bytes` = split-K scratch (`gemm_workspace_size`); `(nullptr,0)` never splits. |
 
@@ -250,8 +252,10 @@ gives a safe scale tail automatically). Same result, but A is padded per-row.
   so a non-divisible M/N silently drops the remainder rows/cols.
 - **B is transposed by `preprocess_B`.** Pass B in its natural `[K][N]` row-major layout; the
   helper produces `Bᵀ[N][K]` and quantizes it.
-- **Scale grouping must match the tile.** Use `choose_tile(M,N).MPW` for A's `tile_scale` and
-  `.NPW` for B's. Mismatched grouping gives wrong results.
+- **Scale grouping must match the tile.** Use `choose_tile(M,N,Kp).MPW` for A's `tile_scale` and
+  `.NPW` for B's, passing the **same padded `Kp` you pass to `gemm()`** — tile choice is K-aware
+  (large-K wide-N routes to 128×128 with different MPW/NPW), so a different `Kp` here silently
+  tiles the scales for the wrong kernel. Mismatched grouping gives wrong results.
 - **`A_row_bytes` / `B_row_bytes`** are the packed bytes per row (= `Quantized.packed_row_bytes`).
   For compact A this is `packed(K)`; for per-row-padded A it is `packed(Kp)`.
 - **E8M0 scale `0xFF` is NaN** and will poison the **entire** output (`0·NaN = NaN`). This is the
@@ -298,7 +302,7 @@ template <int M_TILE, int N_TILE, int K_TILE, int WAVES_M, int WAVES_N, int MIN_
 
 | Param | Default | Meaning |
 |---|---|---|
-| `M_TILE` × `N_TILE` | 256×256 / 128×256 | Register accumulator tile per workgroup. Larger ⇒ higher arithmetic intensity (AI) but fewer workgroups. The live shape knob (`choose_tile`): 256×256 for CU-filling shapes, 128×256 for WG-starved small-M. |
+| `M_TILE` × `N_TILE` | 256×256 / 128×256 / 128×128 | Register accumulator tile per workgroup. Larger ⇒ higher arithmetic intensity (AI) but fewer workgroups. The live shape knob (`choose_tile`): 256×256 for CU-filling shapes, 128×256 for WG-starved small-M, 128×128 for large-K wide-N (shrinks B working set to fit L2). |
 | `K_TILE` | 192 | Deep-K tile depth = size of the MFMA window backing one load. Bigger window hides load latency. `subs = K_TILE/64`. |
 | `WAVES_M` × `WAVES_N` | 2×2 | How the tile is split across the block's 4 waves → per-wave block shape `MPW×NPW` = `(M_TILE/32/WAVES_M)×(N_TILE/32/WAVES_N)`. Sets the load-vs-MFMA ratio (perimeter vs area) and input VGPR. |
 | `MIN_OCC` | 1 | Occupancy floor (`__launch_bounds__` 2nd arg). occ1 holds the largest tile; occ2 forces a smaller AI (see coupling). |
