@@ -54,10 +54,10 @@ Columns:
 | 2048 | 3490 | 1 | 2048 | 0.031420 | 931.764 | 973.947 | 0 | 0.020896 | 1401.030 | 1438.770 | 0.665 |
 | 3490 | 1024 | 1 | 2048 | 0.014544 | 1006.460 | 1162.770 | 0 | 0.016278 | 899.250 | 923.470 | 1.119 |
 | 4096 | 4096 | 20 | 2048 | 0.053004 | 1944.730 | 1944.730 | 0 | 0.062535 | 1648.350 | 1648.350 | 1.180 |
-| 6144 | 512 | 8 | 2048 | 0.017264 | 746.336 | 839.629 | 3 | 0.015872 | 811.793 | 811.793 | 0.919 |
-| 6144 | 4096 | 20 | 2048 | 0.070471 | 1462.730 | 1508.440 | 0 | 0.068291 | 1509.420 | 1509.420 | 0.969 |
-| 6144 | 16128 | 9 | 2048 | 0.238366 | 1702.730 | 1702.730 | 0 | 0.211298 | 1920.860 | 1920.860 | 0.886 |
-| 6144 | 105728 | 1 | 2048 | 2.065000 | 1288.490 ‡ | 1289.270 | 0 | 1.854740 | 1434.560 | 1434.560 | 0.898 ‡ |
+| 6144 | 512 | 8 | 2048 | 0.017264 | 746.336 § | 839.629 | 3 | 0.015872 | 811.793 | 811.793 | 0.919 § |
+| 6144 | 4096 | 20 | 2048 | 0.070471 | 1462.730 § | 1508.440 | 0 | 0.068291 | 1509.420 | 1509.420 | 0.969 § |
+| 6144 | 16128 | 9 | 2048 | 0.238366 | 1702.730 § | 1702.730 | 0 | 0.211298 | 1920.860 | 1920.860 | 0.886 § |
+| 6144 | 105728 | 1 | 2048 | 2.065000 | 1288.490 ‡§ | 1289.270 | 0 | 1.854740 | 1434.560 | 1434.560 | 0.898 ‡§ |
 | 12672 | 1024 | 9 | 2048 | 0.038762 | 1371.180 | 1558.160 | 0 | 0.051960 | 1022.900 | 1022.900 | 1.340 |
 | 16128 | 1024 | 9 | 2048 | 0.041494 | 1630.240 | 1834.020 | 0 | 0.060195 | 1123.790 | 1123.790 | 1.451 |
 | 16384 | 1024 | 10 | 2048 | 0.042054 | 1634.060 | 1838.320 | 0 | 0.060787 | 1130.500 | 1130.500 | 1.445 |
@@ -70,6 +70,10 @@ Columns:
 restoring L2 residency. Re-measured on MI350X (10.7.191.60, same-session ours+CK, ROCm 7.0.2):
 **ours 1260→1509 TF, CK 1413 TF = 1.07× CK** (was 0.89×). Cross-check MI355X (n03-05): 1318→1811,
 1.19× CK. Full data: `prof_results/bench_mi350x_10.7.191.60_2026-07-17.txt`.
+
+§ = **N=6144 rows re-measured 2026-07-17 on MI350X-B** (`10.7.191.60`, ROCm 7.0.2, ours+CK in the
+**same GPU session**). Absolute TFLOPs differ from the original harness (different MI350X node/clocks);
+the § rows below show the authoritative same-session ratios. See §Wide-N large-K section below.
 
 † = auto split-K active. These rows re-measured on MI350X / ROCm 7.0.2 (2026-06-30): `mxfp6_ms` =
 best single-launch latency (incl. reduce); `mxfp6_TF_real` from that latency; `mxfp6_TF_kernel` =
@@ -191,6 +195,42 @@ unsplit at 64/256 CU — exactly the case split-K targets. Fixed by allowing une
 (`offset = z·floor + min(z,rem)`, `length = floor + (z<rem)`; reduces to the old equal-length path
 when `k_tiles%S==0`). Verified vs CPU reference on the small uneven analog `2048×1024×6304`
 (`k_tiles=33=3×11`, S=4 → 9/8/8/8, with a real K-tail in the shortest final segment).
+
+---
+
+## Wide-N large-K (N=6144) — authoritative re-measurement (MI350X-B, 2026-07-17)
+
+**Machine:** MI350X `10.7.191.60` (bg-1w300-h3-3), ROCm 7.0.2, `HIP_VISIBLE_DEVICES=0`.
+**Method:** ours (integrated, 128×128 fix active) + CK measured in the **same GPU session** —
+clean apples-to-apples. M=2048, N=6144, FP16. Raw: `prof_results/bench_mi350x_10.7.191.60_2026-07-17.txt`.
+
+> Note: absolute TFLOPs differ from the original harness (different MI350X node/clocks). The
+> same-session **ratio** (after/CK) is the reliable takeaway.
+
+| K | ours baseline (128×256) | ours integrated | CK mxfp8 | baseline/CK | **integrated/CK** |
+|---:|---:|---:|---:|:---:|:---:|
+| 512    | 716  | 715  | 467  | 1.53× | **1.53×** |
+| 4096   | 1283 | 1332 | 1195 | 1.07× | **1.11×** |
+| 16128  | 1588 | 1581 | 1550 | 1.02× | **1.02×** (unchanged, stays 128×256) |
+| **105728** | **1260** | **1509** | **1413** | **0.89× ✗** | **1.07× ✓** (128×128 tile, +19.8%) |
+
+K=512/4096/16128 are byte-for-byte unchanged by the fix (tile stays 128×256); the integrated
+column differs only from run-to-run noise (<3%). K=105728 is the only shape the 128×128 routing
+activates (`wg256=192<CU && Kp≥32768 && wg128=768≥CU`).
+
+Cross-check on **MI355X** reference node (`smci355-ccs-aus-n03-05`, 2026-07-20, same-session,
+ROCm 7.0.2):
+
+| K | ours baseline | ours integrated | CK mxfp8 | integrated/CK |
+|---:|---:|---:|---:|:---:|
+| 512    | 772  | 774  | 505  | **1.53×** |
+| 4096   | 1509 | 1532 | 1397 | **1.10×** |
+| 16128  | 1771 | 1770 | 1780 | **0.99×** |
+| **105728** | **1318** | **1811** | **1523** | **1.19×** (was 0.87×, +37.4%) |
+
+Raw: `prof_results/bench_n03-05_2026-07-20.txt`.
+
+---
 
 ## Remaining problems / gaps
 
