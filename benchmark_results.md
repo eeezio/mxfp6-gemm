@@ -57,13 +57,19 @@ Columns:
 | 6144 | 512 | 8 | 2048 | 0.017264 | 746.336 | 839.629 | 3 | 0.015872 | 811.793 | 811.793 | 0.919 |
 | 6144 | 4096 | 20 | 2048 | 0.070471 | 1462.730 | 1508.440 | 0 | 0.068291 | 1509.420 | 1509.420 | 0.969 |
 | 6144 | 16128 | 9 | 2048 | 0.238366 | 1702.730 | 1702.730 | 0 | 0.211298 | 1920.860 | 1920.860 | 0.886 |
-| 6144 | 105728 | 1 | 2048 | 2.065000 | 1288.490 | 1289.270 | 0 | 1.854740 | 1434.560 | 1434.560 | 0.898 |
+| 6144 | 105728 | 1 | 2048 | 2.065000 | 1288.490 ‡ | 1289.270 | 0 | 1.854740 | 1434.560 | 1434.560 | 0.898 ‡ |
 | 12672 | 1024 | 9 | 2048 | 0.038762 | 1371.180 | 1558.160 | 0 | 0.051960 | 1022.900 | 1022.900 | 1.340 |
 | 16128 | 1024 | 9 | 2048 | 0.041494 | 1630.240 | 1834.020 | 0 | 0.060195 | 1123.790 | 1123.790 | 1.451 |
 | 16384 | 1024 | 10 | 2048 | 0.042054 | 1634.060 | 1838.320 | 0 | 0.060787 | 1130.500 | 1130.500 | 1.445 |
 | 20480 | 6144 | 9 | 2048 | 0.199770 | 2579.950 | 2579.950 | 0 | 0.294245 | 1751.590 | 1751.590 | 1.473 |
 | 102272 | 1024 | 1 | 2048 | 0.311703 | 1376.180 | 1550.140 | 0 | 0.472239 | 908.354 | 908.354 | 1.515 |
 | 105728 | 1024 | 1 | 2048 | 0.313101 | 1416.330 | 1593.380 | 0 | 0.486935 | 910.708 | 910.708 | 1.555 |
+
+‡ = **FIXED in PR #4 (2026-07-21) via 128×128 tile routing.** `2048×6144×105728` was capacity/BW-bound
+(B/N-slice 20.3 MB overflows L2). Routing to a **128×128 tile** halves the per-WG B slice (→10.2 MB),
+restoring L2 residency. Re-measured on MI350X (10.7.191.60, same-session ours+CK, ROCm 7.0.2):
+**ours 1260→1509 TF, CK 1413 TF = 1.07× CK** (was 0.89×). Cross-check MI355X (n03-05): 1318→1811,
+1.19× CK. Full data: `prof_results/bench_mi350x_10.7.191.60_2026-07-17.txt`.
 
 † = auto split-K active. These rows re-measured on MI350X / ROCm 7.0.2 (2026-06-30): `mxfp6_ms` =
 best single-launch latency (incl. reduce); `mxfp6_TF_real` from that latency; `mxfp6_TF_kernel` =
@@ -196,5 +202,8 @@ when `k_tiles%S==0`). Verified vs CPU reference on the small uneven analog `2048
    `512×6144` 0.52× (now splits → should improve once re-measured).
 4. **Small N + small K is overhead-bound** — N≤256 with small K sit at ~40 kernel TFLOPs and a
    ~5 µs latency floor. Fixed launch/prologue cost dominates; split-K cannot help.
-5. **Wide-N very-large-K L2 sag** — `2048×6144×105728` = 1288 TF; base_wg=384 already fills CUs so split-K doesn't apply; throughput drops as growing K erodes L2 reuse.
+5. ~~**Wide-N very-large-K L2 sag**~~ — **RESOLVED (PR #4).** `2048×6144×105728` was 1288 TF (0.90×
+   CK). Root cause: B/N-slice (256 cols × K × 0.75 = 20.3 MB) overflows L2 → capacity/BW-bound (not
+   latency-bound). Fixed by routing to a **128×128 tile** (halves B slice to 10.2 MB). MI350X result:
+   **1509 TF, 1.07× CK**. See `docs/OPTIMIZATIONS.md §9` and `prof_results/bench_mi350x_*.txt`.
 6. **Split-K's own ceiling** — the FP32 partial-sum write + reduce round-trip caps speedup well below the ideal `S×` (2.99× of an ideal 4× for 105728).
