@@ -54,10 +54,10 @@ Columns:
 | 2048 | 3490 | 1 | 2048 | 0.031420 | 931.764 | 973.947 | 0 | 0.020896 | 1401.030 | 1438.770 | 0.665 |
 | 3490 | 1024 | 1 | 2048 | 0.014544 | 1006.460 | 1162.770 | 0 | 0.016278 | 899.250 | 923.470 | 1.119 |
 | 4096 | 4096 | 20 | 2048 | 0.053004 | 1944.730 | 1944.730 | 0 | 0.062535 | 1648.350 | 1648.350 | 1.180 |
-| 6144 | 512 | 8 | 2048 | 0.017264 | 746.336 § | 839.629 | 3 | 0.015872 | 811.793 | 811.793 | 0.919 § |
-| 6144 | 4096 | 20 | 2048 | 0.070471 | 1462.730 § | 1508.440 | 0 | 0.068291 | 1509.420 | 1509.420 | 0.969 § |
-| 6144 | 16128 | 9 | 2048 | 0.238366 | 1702.730 § | 1702.730 | 0 | 0.211298 | 1920.860 | 1920.860 | 0.886 § |
-| 6144 | 105728 | 1 | 2048 | 2.065000 | 1288.490 ‡§ | 1289.270 | 0 | 1.854740 | 1434.560 | 1434.560 | 0.898 ‡§ |
+| 6144 | 512 | 8 | 2048 | 0.018021 | 715 § | 715 | 3 | 0.027591 | 467 | 467 | **1.531** § |
+| 6144 | 4096 | 20 | 2048 | 0.077387 | 1332 § | 1332 | 0 | 0.086259 | 1195 | 1195 | **1.115** § |
+| 6144 | 16128 | 9 | 2048 | 0.256720 | 1581 § | 1581 | 0 | 0.261854 | 1550 | 1550 | **1.020** § |
+| 6144 | 105728 | 1 | 2048 | 1.763242 | **1509** ‡§ | 1509 | 0 | 1.883038 | 1413 | 1413 | **1.068** ‡§ |
 | 12672 | 1024 | 9 | 2048 | 0.038762 | 1371.180 | 1558.160 | 0 | 0.051960 | 1022.900 | 1022.900 | 1.340 |
 | 16128 | 1024 | 9 | 2048 | 0.041494 | 1630.240 | 1834.020 | 0 | 0.060195 | 1123.790 | 1123.790 | 1.451 |
 | 16384 | 1024 | 10 | 2048 | 0.042054 | 1634.060 | 1838.320 | 0 | 0.060787 | 1130.500 | 1130.500 | 1.445 |
@@ -71,9 +71,10 @@ restoring L2 residency. Re-measured on MI350X (10.7.191.60, same-session ours+CK
 **ours 1260→1509 TF, CK 1413 TF = 1.07× CK** (was 0.89×). Cross-check MI355X (n03-05): 1318→1811,
 1.19× CK. Full data: `prof_results/bench_mi350x_10.7.191.60_2026-07-17.txt`.
 
-§ = **N=6144 rows re-measured 2026-07-17 on MI350X-B** (`10.7.191.60`, ROCm 7.0.2, ours+CK in the
-**same GPU session**). Absolute TFLOPs differ from the original harness (different MI350X node/clocks);
-the § rows below show the authoritative same-session ratios. See §Wide-N large-K section below.
+§ = **N=6144 rows replaced with authoritative re-measurement** (MI350X-B `10.7.191.60`, ROCm 7.0.2,
+2026-07-17, ours (integrated, after 128×128 fix) + CK measured in the **same GPU session**). Original
+harness numbers (different MI350X node, different absolute clocks) archived in the §Wide-N large-K
+section below.
 
 † = auto split-K active. These rows re-measured on MI350X / ROCm 7.0.2 (2026-06-30): `mxfp6_ms` =
 best single-launch latency (incl. reduce); `mxfp6_TF_real` from that latency; `mxfp6_TF_kernel` =
