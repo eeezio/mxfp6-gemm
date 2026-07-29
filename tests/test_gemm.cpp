@@ -222,6 +222,32 @@ static bool verify_128x128(int M, int N, int K) {
     return ok;
 }
 
+// Correctness check for the 128x384 kernel path on SMALL shapes (fast CPU ref).
+// Uses WAVES_M=1, WAVES_N=4: MPW=4, NPW=3. M must be a multiple of 128; N of 384.
+static bool verify_128x384(int M, int N, int K) {
+    constexpr TileChoice tc = {128, 384, 4, 3};
+    Dev x = setup(M, N, K, tc);
+    std::vector<float> Dref((size_t)M * N);
+    mxfp6_gemm_ref(x.Aq, x.Bq, Dref.data(), M, x.Kp, N);
+    float* dD;
+    hipMalloc(&dD, (size_t)M * N * 4);
+    hipMemset(dD, 0x5A, (size_t)M * N * 4);
+    gemm_force_tile(OutType::F32, M, N, x.Kp, tc, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br);
+    hipDeviceSynchronize();
+    std::vector<float> Dg((size_t)M * N);
+    hipMemcpy(Dg.data(), dD, (size_t)M * N * 4, hipMemcpyDeviceToHost);
+    hipFree(dD);
+    float er = 0, mx = 0;
+    for (size_t i = 0; i < (size_t)M * N; i++) {
+        er = fmaxf(er, fabsf(Dg[i] - Dref[i]));
+        mx = fmaxf(mx, fabsf(Dref[i]));
+    }
+    bool ok = er < 2e-2f * fmaxf(1.f, mx);
+    printf("  128x384 %4dx%4dx%4d : %s\n", M, N, K, ok ? "OK" : "FAIL<<<");
+    teardown(x);
+    return ok;
+}
+
 static void perf(int M, int N, int K) {
     int Kp_est = ((K + K_TILE - 1) / K_TILE) * K_TILE;
     TileChoice tc = choose_tile(M, N, Kp_est);
@@ -269,6 +295,10 @@ int main(int argc, char** argv) {
     // 256x256x768: grid 2x2 WGs, k_tiles=4. 384x512x1536: grid 3x4 WGs, k_tiles=8.
     f += !verify_128x128(256, 256, 768);
     f += !verify_128x128(384, 512, 1536);
+    // 128x384 kernel path (WAVES_M=1, WAVES_N=4, MPW=4, NPW=3): small shapes, fast CPU ref.
+    // 256x384x768: grid 2x1 WGs, k_tiles=4. 384x768x960: grid 3x2 WGs, k_tiles=5.
+    f += !verify_128x384(256, 384, 768);
+    f += !verify_128x384(384, 768, 960);
     if (f) {
         printf("  CORRECTNESS FAILED\n");
         return 1;
@@ -278,8 +308,10 @@ int main(int argc, char** argv) {
     int sh[][3] = {{2048, 1024, 12288},   // tier-1: narrow N + large K
                    {2048, 1024, 16128},   // tier-1: narrow N + larger K
                    {2048, 1024, 105728},
-                   {2048, 6144, 16128},   // control: wide N, same K (128x256 path, Kp<32768)
-                   {2048, 6144, 105728}}; // wide N + large K: 128x128 candidate
+                   {2048, 6144, 512},     // wide N small K: 128x384 path
+                   {2048, 6144, 4096},    // wide N medium K: 128x384 path
+                   {2048, 6144, 16128},   // wide N larger K: 128x384 path
+                   {2048, 6144, 105728}}; // wide N + large K: 128x128 path
     for (auto& s : sh) perf(s[0], s[1], s[2]);
     return 0;
 }
