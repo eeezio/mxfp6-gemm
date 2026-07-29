@@ -1,0 +1,137 @@
+128x384 tile — same-machine, same-session A/B vs the 128x256 baseline, plus CK MXFP8.
+
+Machine : MI350X (gfx950, 256 CU), bg-1w300-k2-3a.adc.amd.com (10.6.244.220)
+Image   : rocm/atom:latest  (docker run -e HIP_VISIBLE_DEVICES=0 ...)
+Date    : 2026-07-29
+Shape   : M=2048, N=6144, FP16 output
+Builds  : "base" = origin/main (3ef9040, 128x256 route for Kp<32768)
+          "new"  = base + the 128x384 tile
+          Both built from the same tarball pair in the same container invocation;
+          only src/gemm.cpp choose_tile + src/dispatch.hpp differ.
+CK      : ~/prof_n6144/ck/tile_example_mx_flatmm
+          -m=2048 -n=6144 -k=$K -mx_prec=fp8xfp8 -v=0 -warmup=20 -repeat=50
+
+Why this run exists: every previously quoted "128x256 -> 128x384" delta compared
+numbers taken on DIFFERENT machines. This run measures both builds back-to-back on
+one GPU so the deltas are defensible.
+
+================================================================================
+1. Correctness (both builds, same container)
+================================================================================
+
+===== BASE correctness =====
+=== libmxfp6gemm correctness (end-to-end, CPU ref) ===
+   512x 512x 768 -> 128x256 : OK
+   768x1280x 960 -> 128x256 : OK
+  4096x4096x 768 -> 256x256 : OK
+  compact 4096x4096x 224 (Kp=384) -> 256x256 : NaNs=0 OK
+  compact  768x1280x 224 (Kp=384) -> 128x256 : NaNs=0 OK
+  compact  512x 512x 160 (Kp=192) -> 128x256 : NaNs=0 OK
+  compact 2048x1024x12288 (Kp=12288) -> 128x256 : NaNs=0 OK
+  compact 2048x1024x3808 (Kp=3840) -> 128x256 : NaNs=0 OK
+  compact 2048x1024x6304 (Kp=6336) -> 128x256 : NaNs=0 OK
+  128x128  256x 256x 768 : OK
+  128x128  384x 512x1536 : OK
+  all OK
+
+=== first-tier shapes (M=2048), FP16 ===
+   2048x 1024x12288 wg= 256 S=4 -> 128x256 : 1209 TFLOPs
+   2048x 1024x16128 wg= 256 S=4 -> 128x256 : 1361 TFLOPs
+   2048x 1024x105728 wg= 256 S=4 -> 128x256 : 1621 TFLOPs
+   2048x 6144x16128 wg= 384 S=1 -> 128x256 : 1706 TFLOPs
+   2048x 6144x105728 wg= 768 S=1 -> 128x128 : 1759 TFLOPs
+
+===== NEW correctness =====
+=== libmxfp6gemm correctness (end-to-end, CPU ref) ===
+   512x 512x 768 -> 128x256 : OK
+   768x1280x 960 -> 128x256 : OK
+  4096x4096x 768 -> 256x256 : OK
+  compact 4096x4096x 224 (Kp=384) -> 256x256 : NaNs=0 OK
+  compact  768x1280x 224 (Kp=384) -> 128x256 : NaNs=0 OK
+  compact  512x 512x 160 (Kp=192) -> 128x256 : NaNs=0 OK
+  compact 2048x1024x12288 (Kp=12288) -> 128x256 : NaNs=0 OK
+  compact 2048x1024x3808 (Kp=3840) -> 128x256 : NaNs=0 OK
+  compact 2048x1024x6304 (Kp=6336) -> 128x256 : NaNs=0 OK
+  128x128  256x 256x 768 : OK
+  128x128  384x 512x1536 : OK
+  128x384  256x 384x 768 : OK
+  128x384  384x 768x 960 : OK
+  all OK
+
+=== first-tier shapes (M=2048), FP16 ===
+   2048x 1024x12288 wg= 256 S=4 -> 128x256 : 1210 TFLOPs
+   2048x 1024x16128 wg= 256 S=4 -> 128x256 : 1370 TFLOPs
+   2048x 1024x105728 wg= 256 S=4 -> 128x256 : 1592 TFLOPs
+   2048x 6144x  512 wg= 256 S=1 -> 128x384 : 964 TFLOPs
+   2048x 6144x 4096 wg= 256 S=1 -> 128x384 : 2142 TFLOPs
+   2048x 6144x16128 wg= 256 S=1 -> 128x384 : 2710 TFLOPs
+   2048x 6144x105728 wg= 768 S=1 -> 128x128 : 1762 TFLOPs
+
+Non-N=6144 shapes are unchanged within run-to-run noise (<2%), and K=105728 keeps
+the 128x128 route byte-for-byte -> no regression.
+
+================================================================================
+2. Interleaved A/B, 3 repetitions (base and new alternate per shape)
+================================================================================
+
+rep1 K=512     base :    2048x 6144x  512 wg= 384 S=1 -> 128x256 : 746 TFLOPs
+rep1 K=512     new  :    2048x 6144x  512 wg= 256 S=1 -> 128x384 : 966 TFLOPs
+rep1 K=4096    base :    2048x 6144x 4096 wg= 384 S=1 -> 128x256 : 1429 TFLOPs
+rep1 K=4096    new  :    2048x 6144x 4096 wg= 256 S=1 -> 128x384 : 2131 TFLOPs
+rep1 K=16128   base :    2048x 6144x16128 wg= 384 S=1 -> 128x256 : 1702 TFLOPs
+rep1 K=16128   new  :    2048x 6144x16128 wg= 256 S=1 -> 128x384 : 2707 TFLOPs
+rep1 K=105728  base :    2048x 6144x105728 wg= 768 S=1 -> 128x128 : 1762 TFLOPs
+rep1 K=105728  new  :    2048x 6144x105728 wg= 768 S=1 -> 128x128 : 1759 TFLOPs
+rep2 K=512     base :    2048x 6144x  512 wg= 384 S=1 -> 128x256 : 746 TFLOPs
+rep2 K=512     new  :    2048x 6144x  512 wg= 256 S=1 -> 128x384 : 968 TFLOPs
+rep2 K=4096    base :    2048x 6144x 4096 wg= 384 S=1 -> 128x256 : 1427 TFLOPs
+rep2 K=4096    new  :    2048x 6144x 4096 wg= 256 S=1 -> 128x384 : 2111 TFLOPs
+rep2 K=16128   base :    2048x 6144x16128 wg= 384 S=1 -> 128x256 : 1703 TFLOPs
+rep2 K=16128   new  :    2048x 6144x16128 wg= 256 S=1 -> 128x384 : 2760 TFLOPs
+rep2 K=105728  base :    2048x 6144x105728 wg= 768 S=1 -> 128x128 : 1761 TFLOPs
+rep2 K=105728  new  :    2048x 6144x105728 wg= 768 S=1 -> 128x128 : 1761 TFLOPs
+rep3 K=512     base :    2048x 6144x  512 wg= 384 S=1 -> 128x256 : 742 TFLOPs
+rep3 K=512     new  :    2048x 6144x  512 wg= 256 S=1 -> 128x384 : 964 TFLOPs
+rep3 K=4096    base :    2048x 6144x 4096 wg= 384 S=1 -> 128x256 : 1419 TFLOPs
+rep3 K=4096    new  :    2048x 6144x 4096 wg= 256 S=1 -> 128x384 : 2136 TFLOPs
+rep3 K=16128   base :    2048x 6144x16128 wg= 384 S=1 -> 128x256 : 1693 TFLOPs
+rep3 K=16128   new  :    2048x 6144x16128 wg= 256 S=1 -> 128x384 : 2666 TFLOPs
+rep3 K=105728  base :    2048x 6144x105728 wg= 768 S=1 -> 128x128 : 1762 TFLOPs
+rep3 K=105728  new  :    2048x 6144x105728 wg= 768 S=1 -> 128x128 : 1758 TFLOPs
+
+Medians (TFLOPs):
+  K        base(128x256)  new(128x384)  delta
+  512      746            966           +29.5%
+  4096     1427           2131          +49.3%
+  16128    1702           2707          +59.0%
+  105728   1762           1759          +-0    (both keep the 128x128 route)
+
+================================================================================
+3. CK MXFP8 baseline, same session
+================================================================================
+
+CK K=512     : ... M = 2048 N = 6144 K = 512    : 0.0281121 ms,  472.664 TFlops, 1049.06 GB/s
+CK K=4096    : ... M = 2048 N = 6144 K = 4096   : 0.0823964 ms, 1290.11  TFlops,  725.381 GB/s
+CK K=16128   : ... M = 2048 N = 6144 K = 16128  : 0.252993  ms, 1654.42  TFlops,  638.022 GB/s
+CK K=105728  : ... M = 2048 N = 6144 K = 105728 : 1.87594   ms, 1462.67  TFlops,  489.543 GB/s
+
+Ratios vs CK (median of ours / CK TFlops):
+  K        base/CK   new/CK
+  512      1.58x     2.04x
+  4096     1.11x     1.65x
+  16128    1.03x     1.64x
+  105728   1.20x     1.20x   (unchanged, 128x128 route)
+
+base/CK at K=16128 = 1.03x reproduces the historical 1.02x for this shape on other
+MI350X nodes, which is the sanity check that this session's baseline is the real one.
+
+================================================================================
+4. Compile-time resources (gfx950, -Rpass-analysis=kernel-resource-usage)
+================================================================================
+
+lds_gemm_hybrid_dripA<128, 384, 192, 1, 4, 1, 0, OutT, false>   (f32 and __half)
+  TotalSGPRs 42 | VGPRs 218 | AGPRs 192
+  ScratchSize [bytes/lane] 0 | SGPRs Spill 0 | VGPRs Spill 0
+  Occupancy [waves/SIMD] 1 | Dynamic Stack False
+
+Whole build: 24 kernels reported, 24 with ScratchSize 0, 0 with any spill.

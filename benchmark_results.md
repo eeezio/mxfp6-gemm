@@ -54,10 +54,10 @@ Columns:
 | 2048 | 3490 | 1 | 2048 | 0.031420 | 931.764 | 973.947 | 0 | 0.020896 | 1401.030 | 1438.770 | 0.665 |
 | 3490 | 1024 | 1 | 2048 | 0.014544 | 1006.460 | 1162.770 | 0 | 0.016278 | 899.250 | 923.470 | 1.119 |
 | 4096 | 4096 | 20 | 2048 | 0.053004 | 1944.730 | 1944.730 | 0 | 0.062535 | 1648.350 | 1648.350 | 1.180 |
-| 6144 | 512 | 8 | 2048 | 0.018021 | 715 § | 715 | 3 | 0.027591 | 467 | 467 | **1.531** § |
-| 6144 | 4096 | 20 | 2048 | 0.077387 | 1332 § | 1332 | 0 | 0.086259 | 1195 | 1195 | **1.115** § |
-| 6144 | 16128 | 9 | 2048 | 0.256720 | 1581 § | 1581 | 0 | 0.261854 | 1550 | 1550 | **1.020** § |
-| 6144 | 105728 | 1 | 2048 | 1.763242 | **1509** ‡§ | 1509 | 0 | 1.883038 | 1413 | 1413 | **1.068** ‡§ |
+| 6144 | 512 | 8 | 2048 | 0.013338 | **966** ¶§ | 966 | 3 | 0.028112 | 473 | 473 | **2.044** ¶§ |
+| 6144 | 4096 | 20 | 2048 | 0.048371 | **2131** ¶§ | 2131 | 0 | 0.082396 | 1290 | 1290 | **1.652** ¶§ |
+| 6144 | 16128 | 9 | 2048 | 0.149935 | **2707** ¶§ | 2707 | 0 | 0.252993 | 1654 | 1654 | **1.636** ¶§ |
+| 6144 | 105728 | 1 | 2048 | 1.512637 | **1759** ‡§ | 1759 | 0 | 1.875940 | 1463 | 1463 | **1.203** ‡§ |
 | 12672 | 1024 | 9 | 2048 | 0.038762 | 1371.180 | 1558.160 | 0 | 0.051960 | 1022.900 | 1022.900 | 1.340 |
 | 16128 | 1024 | 9 | 2048 | 0.041494 | 1630.240 | 1834.020 | 0 | 0.060195 | 1123.790 | 1123.790 | 1.451 |
 | 16384 | 1024 | 10 | 2048 | 0.042054 | 1634.060 | 1838.320 | 0 | 0.060787 | 1130.500 | 1130.500 | 1.445 |
@@ -67,14 +67,17 @@ Columns:
 
 ‡ = **FIXED in PR #4 (2026-07-21) via 128×128 tile routing.** `2048×6144×105728` was capacity/BW-bound
 (B/N-slice 20.3 MB overflows L2). Routing to a **128×128 tile** halves the per-WG B slice (→10.2 MB),
-restoring L2 residency. Re-measured on MI350X (10.7.191.60, same-session ours+CK, ROCm 7.0.2):
-**ours 1260→1509 TF, CK 1413 TF = 1.07× CK** (was 0.89×). Cross-check MI355X (n03-05): 1318→1811,
-1.19× CK. Full data: `prof_results/bench_mi350x_10.7.191.60_2026-07-17.txt`.
+restoring L2 residency, and the 128×384 tile below deliberately does *not* take this shape.
+Cross-check on MI355X (n03-05, 2026-07-20): 1318→1811 TF, 1.19× CK.
 
-§ = **N=6144 rows replaced with authoritative re-measurement** (MI350X-B `10.7.191.60`, ROCm 7.0.2,
-2026-07-17, ours (integrated, after 128×128 fix) + CK measured in the **same GPU session**). Original
-harness numbers (different MI350X node, different absolute clocks) archived in the §Wide-N large-K
-section below.
+¶ = **improved by the 128×384 tile.** `128×256` puts 384 WGs on 256 CUs = 1.5 waves; `128×384` puts
+exactly 256 = 1 wave, and also raises accumulators/wave 8→12 and compute per B ring slot 64→128 cyc.
+See the §Wide-N (N=6144) section below for the same-machine 128×256 → 128×384 A/B.
+
+§ = **N=6144 rows replaced with authoritative re-measurement** (MI350X `bg-1w300-k2-3a`,
+`rocm/atom:latest`, 2026-07-29, ours + CK measured in the **same GPU session**; `mxfp6_ms` derived
+from the measured TFLOPs). Original harness numbers (different MI350X node, different absolute
+clocks) are superseded — absolute TFLOPs are not comparable across nodes, only same-session ratios.
 
 † = auto split-K active. These rows re-measured on MI350X / ROCm 7.0.2 (2026-06-30): `mxfp6_ms` =
 best single-launch latency (incl. reduce); `mxfp6_TF_real` from that latency; `mxfp6_TF_kernel` =
@@ -199,27 +202,35 @@ when `k_tiles%S==0`). Verified vs CPU reference on the small uneven analog `2048
 
 ---
 
-## Wide-N large-K (N=6144) — authoritative re-measurement (MI350X-B, 2026-07-17)
+## Wide-N (N=6144) — 128×256 → 128×384, same-machine A/B (MI350X, 2026-07-29)
 
-**Machine:** MI350X `10.7.191.60` (bg-1w300-h3-3), ROCm 7.0.2, `HIP_VISIBLE_DEVICES=0`.
-**Method:** ours (integrated, 128×128 fix active) + CK measured in the **same GPU session** —
-clean apples-to-apples. M=2048, N=6144, FP16. Raw: `prof_results/bench_mi350x_10.7.191.60_2026-07-17.txt`.
+**Machine:** MI350X (gfx950, 256 CU) `bg-1w300-k2-3a`, image `rocm/atom:latest`,
+`HIP_VISIBLE_DEVICES=0`. **Method:** the `128×256` baseline (`origin/main`) and the `128×384` build
+are compiled from the same source pair in one container invocation and run **interleaved, 3 reps**,
+with CK measured in the same session. M=2048, N=6144, FP16.
+Raw: `prof_results/bench_mi350x_k2-3a_2026-07-29.txt`.
 
-> Note: absolute TFLOPs differ from the original harness (different MI350X node/clocks). The
-> same-session **ratio** (after/CK) is the reliable takeaway.
+> Why this run exists: every earlier "128×256 → 128×384" delta compared numbers taken on *different*
+> machines. Absolute TFLOPs are not comparable across nodes — only same-session deltas and ratios.
 
-| K | ours baseline (128×256) | ours integrated | CK mxfp8 | baseline/CK | **integrated/CK** |
-|---:|---:|---:|---:|:---:|:---:|
-| 512    | 716  | 715  | 467  | 1.53× | **1.53×** |
-| 4096   | 1283 | 1332 | 1195 | 1.07× | **1.11×** |
-| 16128  | 1588 | 1581 | 1550 | 1.02× | **1.02×** (unchanged, stays 128×256) |
-| **105728** | **1260** | **1509** | **1413** | **0.89× ✗** | **1.07× ✓** (128×128 tile, +19.8%) |
+| K | baseline (128×256) | **128×384** | Δ | CK mxfp8 | baseline/CK | **new/CK** |
+|---:|---:|---:|:---:|---:|:---:|:---:|
+| 512    | 746  | **966**  | +29.5% | 473  | 1.58× | **2.04×** |
+| 4096   | 1427 | **2131** | +49.3% | 1290 | 1.11× | **1.65×** |
+| 16128  | 1702 | **2707** | +59.0% | 1654 | 1.03× | **1.64×** |
+| 105728 | 1762 | 1759     | ±0     | 1463 | 1.20× | **1.20×** (control: stays 128×128) |
 
-K=512/4096/16128 are byte-for-byte unchanged by the fix (tile stays 128×256); the integrated
-column differs only from run-to-run noise (<3%). K=105728 is the only shape the 128×128 routing
-activates (`wg256=192<CU && Kp≥32768 && wg128=768≥CU`).
+Median of 3 reps; spread was ≤3% on every cell. K=105728 is the control — it is gated out of the
+128×384 route (`Kp < LARGEK_THRESH`) because a 384-column B slice would be 30.5 MB and overflow L2,
+so it keeps the 128×128 route and is byte-for-byte identical. `base/CK` at K=16128 = 1.03×
+reproduces the historical 1.02× for this shape, which is the check that the baseline is sound.
 
-Cross-check on **MI355X** reference node (`smci355-ccs-aus-n03-05`, 2026-07-20, same-session,
+The gain compounds three effects: wave quantization removed (384 WGs / 1.5 waves → 256 WGs /
+1 wave), accumulators per wave 8 → 12, and compute per B ring slot 64 → 128 cyc so the PFD=5
+prefetch ring covers 640 cyc instead of 320. Effects 2 and 3 are why the shallower K gained
+proportionally more than the wave-quantization argument alone predicts.
+
+Earlier cross-check of the **128×128** (large-K) fix on the **MI355X** reference node (`smci355-ccs-aus-n03-05`, 2026-07-20, same-session,
 ROCm 7.0.2):
 
 | K | ours baseline | ours integrated | CK mxfp8 | integrated/CK |
@@ -229,7 +240,8 @@ ROCm 7.0.2):
 | 16128  | 1771 | 1770 | 1780 | **0.99×** |
 | **105728** | **1318** | **1811** | **1523** | **1.19×** (was 0.87×, +37.4%) |
 
-Raw: `prof_results/bench_n03-05_2026-07-20.txt`.
+Raw: `prof_results/bench_n03-05_2026-07-20.txt`. The superseded 2026-07-17 MI350X-B run that this
+section previously quoted is retained raw in `prof_results/bench_mi350x_10.7.191.60_2026-07-17.txt`.
 
 ---
 
@@ -246,5 +258,9 @@ Raw: `prof_results/bench_n03-05_2026-07-20.txt`.
 5. ~~**Wide-N very-large-K L2 sag**~~ — **RESOLVED (PR #4).** `2048×6144×105728` was 1288 TF (0.90×
    CK). Root cause: B/N-slice (256 cols × K × 0.75 = 20.3 MB) overflows L2 → capacity/BW-bound (not
    latency-bound). Fixed by routing to a **128×128 tile** (halves B slice to 10.2 MB). MI350X result:
-   **1509 TF, 1.07× CK**. See `docs/OPTIMIZATIONS.md §9` and `prof_results/bench_mi350x_*.txt`.
+   **1.20× CK**; MI355X **1.19× CK**. See `docs/OPTIMIZATIONS.md §9` and `prof_results/bench_mi350x_*.txt`.
 6. **Split-K's own ceiling** — the FP32 partial-sum write + reduce round-trip caps speedup well below the ideal `S×` (2.99× of an ideal 4× for 105728).
+7. ~~**Wide-N moderate-K wave quantization**~~ — **RESOLVED.** `2048×6144×{512,4096,16128}` ran
+   384 WGs on 256 CUs (1.5 waves). Routing `N%384==0` moderate-K shapes to a **128×384 tile** gives
+   exactly 256 WGs; +29%/+49%/+59% and 1.64–2.04× CK. The N=6144 shapes that still trail are gone;
+   remaining N=6144 work is the large-K `128×128` route at 1.20× CK.
