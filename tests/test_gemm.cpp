@@ -265,8 +265,8 @@ static void perf(int M, int N, int K) {
     int base_wg = (M / tc.MT) * (N / tc.NT);
     int S = wsb ? (int)(wsb / ((size_t)M * N * sizeof(float))) : 1;  // S from workspace size
     int wg = base_wg * S;
-    printf("  %5dx%5dx%5d wg=%4d S=%d -> %3dx%3d : %.0f TFLOPs\n", M, N, K, wg, S, tc.MT, tc.NT,
-           tf(M, N, K, ms));
+    printf("  %5dx%6dx%6d wg=%5d S=%d -> %3dx%3d : %9.6f ms  %8.3f TFLOPs\n", M, N, K, wg, S,
+           tc.MT, tc.NT, ms, tf(M, N, K, ms));
     if (ws) hipFree(ws);
     hipFree(dD);
     teardown(x);
