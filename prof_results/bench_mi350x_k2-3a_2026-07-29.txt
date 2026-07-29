@@ -135,3 +135,77 @@ lds_gemm_hybrid_dripA<128, 384, 192, 1, 4, 1, 0, OutT, false>   (f32 and __half)
   Occupancy [waves/SIMD] 1 | Dynamic Stack False
 
 Whole build: 24 kernels reported, 24 with ScratchSize 0, 0 with any spill.
+
+================================================================================
+5. Full-table sweep — every benchmark_results.md shape our kernel can run
+================================================================================
+
+Same machine/date/image as above. 36 shapes (all rows with N % 256 == 0); one pass of
+`test_gemm 2048 N K` each, then CK on the same list. The 14 rows with N % 256 != 0 are
+omitted: the launch grid is dim3(M/MT, N/NT) with integer division, so those shapes are
+either not launched at all (N=1, N=128 -> floor(N/256)=0) or leave floor(N/256)*256..N
+uncomputed (N=3490 / 12672 / 102272).
+
+CK refuses K % 256 != 0 ("Can't support K that is not a multiple of KPerBlock without
+padding!" / "K must be multiple of ScaleGranularityK"), which is why 14 of the CK lines
+below are blank. CK also has no config sweep in this binary (-persistent=1 fails on these
+shapes), and at N <= 1024 its single config lands at 0.33-0.54x of the tuned CK numbers
+the 2026-06 harness recorded -- so only the N >= 4096 CK numbers are used in the table.
+
+##### OURS #####
+   2048x   256x    64 wg=   16 S=1 -> 128x256 :  0.005186 ms    12.940 TFLOPs
+   2048x   256x    80 wg=   16 S=1 -> 128x256 :  0.005180 ms    16.194 TFLOPs
+   2048x   256x    96 wg=   16 S=1 -> 128x256 :  0.005172 ms    19.464 TFLOPs
+   2048x   256x   128 wg=   16 S=1 -> 128x256 :  0.005174 ms    25.941 TFLOPs
+   2048x   256x   144 wg=   16 S=1 -> 128x256 :  0.005186 ms    29.116 TFLOPs
+   2048x   256x   160 wg=   16 S=1 -> 128x256 :  0.005178 ms    32.401 TFLOPs
+   2048x   256x   256 wg=   16 S=1 -> 128x256 :  0.006546 ms    41.008 TFLOPs
+   2048x   256x   512 wg=   16 S=1 -> 128x256 :  0.007850 ms    68.392 TFLOPs
+   2048x   256x  2048 wg=   16 S=1 -> 128x256 :  0.017514 ms   122.616 TFLOPs
+   2048x   512x  2560 wg=   32 S=1 -> 128x256 :  0.021296 ms   252.102 TFLOPs
+   2048x   512x  6144 wg=  128 S=4 -> 128x256 :  0.024156 ms   533.407 TFLOPs
+   2048x   768x    24 wg=   48 S=1 -> 128x256 :  0.005448 ms    13.858 TFLOPs
+   2048x   768x    32 wg=   48 S=1 -> 128x256 :  0.005472 ms    18.396 TFLOPs
+   2048x   768x    64 wg=   48 S=1 -> 128x256 :  0.005442 ms    36.995 TFLOPs
+   2048x   768x    92 wg=   48 S=1 -> 128x256 :  0.005460 ms    53.005 TFLOPs
+   2048x   768x    96 wg=   48 S=1 -> 128x256 :  0.005456 ms    55.351 TFLOPs
+   2048x   768x   104 wg=   48 S=1 -> 128x256 :  0.005478 ms    59.722 TFLOPs
+   2048x   768x   152 wg=   48 S=1 -> 128x256 :  0.005462 ms    87.542 TFLOPs
+   2048x   768x   240 wg=   48 S=1 -> 128x256 :  0.006854 ms   110.152 TFLOPs
+   2048x   768x   520 wg=   48 S=1 -> 128x256 :  0.008190 ms   199.731 TFLOPs
+   2048x   768x  1840 wg=   48 S=1 -> 128x256 :  0.016798 ms   344.576 TFLOPs
+   2048x  1024x  1024 wg=   64 S=1 -> 128x256 :  0.011988 ms   358.275 TFLOPs
+   2048x  1024x  3490 wg=  128 S=2 -> 128x256 :  0.027386 ms   534.514 TFLOPs
+   2048x  1024x 12288 wg=  256 S=4 -> 128x256 :  0.042668 ms  1207.927 TFLOPs
+   2048x  1024x 16128 wg=  256 S=4 -> 128x256 :  0.049794 ms  1358.512 TFLOPs
+   2048x  1024x105728 wg=  256 S=4 -> 128x256 :  0.277809 ms  1596.260 TFLOPs
+   2048x  2048x  3490 wg=  256 S=2 -> 128x256 :  0.033978 ms   861.623 TFLOPs
+   2048x  4096x  4096 wg=  256 S=1 -> 128x256 :  0.040990 ms  1676.506 TFLOPs
+   2048x  6144x   512 wg=  256 S=1 -> 128x384 :  0.013384 ms   962.720 TFLOPs
+   2048x  6144x  4096 wg=  256 S=1 -> 128x384 :  0.048574 ms  2122.115 TFLOPs
+   2048x  6144x 16128 wg=  256 S=1 -> 128x384 :  0.152826 ms  2655.786 TFLOPs
+   2048x  6144x105728 wg=  768 S=1 -> 128x128 :  1.513014 ms  1758.564 TFLOPs
+   2048x 16128x  1024 wg=  504 S=1 -> 256x256 :  0.043622 ms  1550.731 TFLOPs
+   2048x 16384x  1024 wg=  512 S=1 -> 256x256 :  0.043702 ms  1572.467 TFLOPs
+   2048x 20480x  6144 wg=  640 S=1 -> 256x256 :  0.207322 ms  2485.968 TFLOPs
+   2048x105728x  1024 wg= 3304 S=1 -> 256x256 :  0.311644 ms  1422.953 TFLOPs
+##### CK #####
+CK N=256     K=64      : CK N=256     K=80      : CK N=256     K=96      : CK N=256     K=128     : CK N=256     K=144     : CK N=256     K=160     : CK N=256     K=256     : 0.0139415 ms, 19.8561 TFlops
+CK N=256     K=512     : 0.0151167 ms, 36.625 TFlops
+CK N=256     K=2048    : 0.0239638 ms, 92.4139 TFlops
+CK N=512     K=2560    : 0.0272687 ms, 203.034 TFlops
+CK N=512     K=6144    : 0.0573444 ms, 231.715 TFlops
+CK N=768     K=24      : CK N=768     K=32      : CK N=768     K=64      : CK N=768     K=92      : CK N=768     K=96      : CK N=768     K=104     : CK N=768     K=152     : CK N=768     K=240     : CK N=768     K=520     : CK N=768     K=1840    : CK N=1024    K=1024    : 0.0193087 ms, 229.389 TFlops
+CK N=1024    K=3490    : CK N=1024    K=12288   : 0.10059 ms, 528.387 TFlops
+CK N=1024    K=16128   : 0.125939 ms, 553.916 TFlops
+CK N=1024    K=105728  : 0.935911 ms, 488.629 TFlops
+CK N=2048    K=3490    : CK N=4096    K=4096    : 0.0483855 ms, 1464.63 TFlops
+CK N=6144    K=512     : 0.0282254 ms, 470.766 TFlops
+CK N=6144    K=4096    : 0.0830843 ms, 1279.43 TFlops
+CK N=6144    K=16128   : 0.252273 ms, 1659.15 TFlops
+CK N=6144    K=105728  : 1.87556 ms, 1462.97 TFlops
+CK N=16128   K=1024    : 0.0675948 ms, 1032.03 TFlops
+CK N=16384   K=1024    : 0.0685038 ms, 1034.5 TFlops
+CK N=20480   K=6144    : 0.272072 ms, 1953.54 TFlops
+CK N=105728  K=1024    : 0.490322 ms, 932.68 TFlops
+##### DONE #####
