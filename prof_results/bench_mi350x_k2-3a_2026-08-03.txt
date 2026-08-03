@@ -1,0 +1,76 @@
+Verification re-run of the shipped router under a pinned, version-checked image.
+
+Machine : MI350X (gfx950, 256 CU), bg-1w300-k2-3a.adc.amd.com (10.6.244.220)
+Image   : built from docker/Dockerfile, base
+          rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.13_pytorch_release_2.9.1
+ROCm    : 7.0.2   (literal `cat /opt/rocm/.info/version` inside the container)
+Date    : 2026-08-03
+Build   : compiled in the same ROCm 7.0.2 image on the WSL host, binary copied to
+          the node (md5 verified identical); everything runs inside the container.
+Commit  : 379d576 + the routing-gate fix (choose_tile cost model + check_routing)
+
+Why this run exists: the 2026-07-29 dataset was taken under `rocm/atom:latest`, a
+moving tag whose ROCm version was never recorded, so its toolchain is not
+reproducible. This run re-measures the same machine under a pinned image with the
+version captured literally, to show the published table still holds. It does NOT
+replace the 2026-07-29 A/B numbers -- that run's value is the interleaved
+base-vs-new comparison, which this run does not repeat.
+
+Agreement with prof_results/bench_mi350x_k2-3a_2026-07-29.txt (median of 3 reps):
+    2048x  6144x 16128   2655.8 -> 2651.1   -0.2%
+    2048x  6144x105728   1758.6 -> 1768.6   +0.6%
+    2048x105728x  1024   1423.0 -> 1395.0   -2.0%
+    2048x102272x  1024        -- -> 1358.6  (no prior figure; see note below)
+
+Note on 2048x102272x1024: N%256 != 0 and N%384 != 0, so the router falls through
+to 256x256, which launches dim3(M/256, N/256) = dim3(8, 399) and silently leaves
+the last 128 output columns uncomputed. The figure above is a 2048x102144x1024
+GEMM charged against the full N. It is recorded here only for completeness and
+must not be quoted as a measurement of this shape.
+
+##### ENV #####
+ROCm: 7.0.2
+date: 2026-08-02T19:46:10+00:00
+  Name:                    gfx950                             
+
+##### FULL SUITE (correctness + 7-shape sweep) #####
+=== libmxfp6gemm correctness (end-to-end, CPU ref) ===
+  choose_tile routing: 18/18 OK
+   512x 512x 768 -> 128x256 : OK
+   768x1280x 960 -> 128x256 : OK
+  4096x4096x 768 -> 256x256 : OK
+  compact 4096x4096x 224 (Kp=384) -> 256x256 : NaNs=0 OK
+  compact  768x1280x 224 (Kp=384) -> 128x256 : NaNs=0 OK
+  compact  512x 512x 160 (Kp=192) -> 128x256 : NaNs=0 OK
+  compact 2048x1024x12288 (Kp=12288) -> 128x256 : NaNs=0 OK
+  compact 2048x1024x3808 (Kp=3840) -> 128x256 : NaNs=0 OK
+  compact 2048x1024x6304 (Kp=6336) -> 128x256 : NaNs=0 OK
+  128x128  256x 256x 768 : OK
+  128x128  384x 512x1536 : OK
+  128x384  256x 384x 768 : OK
+  128x384  384x 768x 960 : OK
+  all OK
+
+=== first-tier shapes (M=2048), FP16 ===
+   2048x  1024x 12288 wg=  256 S=4 -> 128x256 :  0.042592 ms  1210.069 TFLOPs
+   2048x  1024x 16128 wg=  256 S=4 -> 128x256 :  0.049840 ms  1357.248 TFLOPs
+   2048x  1024x105728 wg=  256 S=4 -> 128x256 :  0.276538 ms  1603.597 TFLOPs
+   2048x  6144x   512 wg=  256 S=1 -> 128x384 :  0.013752 ms   936.941 TFLOPs
+   2048x  6144x  4096 wg=  256 S=1 -> 128x384 :  0.049048 ms  2101.586 TFLOPs
+   2048x  6144x 16128 wg=  256 S=1 -> 128x384 :  0.155007 ms  2618.425 TFLOPs
+   2048x  6144x105728 wg=  768 S=1 -> 128x128 :  1.507666 ms  1764.802 TFLOPs
+
+##### TARGET 4 SHAPES, 3 reps #####
+rep1     2048x  6144x 16128 wg=  256 S=1 -> 128x384 :  0.153096 ms  2651.103 TFLOPs
+rep1     2048x  6144x105728 wg=  768 S=1 -> 128x128 :  1.504100 ms  1768.986 TFLOPs
+rep1     2048x105728x  1024 wg= 3304 S=1 -> 256x256 :  0.317733 ms  1395.685 TFLOPs
+rep1     2048x102272x  1024 wg= 3192 S=1 -> 256x256 :  0.315395 ms  1360.072 TFLOPs
+rep2     2048x  6144x 16128 wg=  256 S=1 -> 128x384 :  0.150629 ms  2694.533 TFLOPs
+rep2     2048x  6144x105728 wg=  768 S=1 -> 128x128 :  1.507066 ms  1765.505 TFLOPs
+rep2     2048x105728x  1024 wg= 3304 S=1 -> 256x256 :  0.318461 ms  1392.495 TFLOPs
+rep2     2048x102272x  1024 wg= 3192 S=1 -> 256x256 :  0.315739 ms  1358.590 TFLOPs
+rep3     2048x  6144x 16128 wg=  256 S=1 -> 128x384 :  0.155609 ms  2608.303 TFLOPs
+rep3     2048x  6144x105728 wg=  768 S=1 -> 128x128 :  1.504447 ms  1768.578 TFLOPs
+rep3     2048x105728x  1024 wg= 3304 S=1 -> 256x256 :  0.317881 ms  1395.036 TFLOPs
+rep3     2048x102272x  1024 wg= 3192 S=1 -> 256x256 :  0.315963 ms  1357.627 TFLOPs
+##### DONE #####

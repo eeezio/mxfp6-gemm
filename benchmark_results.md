@@ -16,6 +16,12 @@ K is zero-padded to a multiple of `K_TILE=192` inside the harness and TFLOPs are
 nominal K, so rows whose K is not a multiple of 32 (which `preprocess.hpp` requires of a real caller)
 are measured as their padded equivalent — the padding waste shows up as a lower `ours_TF`.
 
+> ⚠️ **Toolchain caveat.** `rocm/atom:latest` is a moving tag and its ROCm version was not recorded
+> at the time, so this run's toolchain cannot be reproduced exactly. It is left as measured rather
+> than back-filled with a version that was never observed. The table was re-checked on 2026-08-03 on
+> the same machine under a pinned, version-verified ROCm 7.0.2 image and agrees to within 2% — see
+> [Reproduction under a pinned image](#reproduction-under-a-pinned-image-2026-08-03).
+
 
 | N | K | count | tile | S | ours_ms | ours_TF | ck_ms | ck_TF | ours/CK | source |
 |---:|---:|---:|:---:|:---:|---:|---:|---:|---:|:---:|:---|
@@ -88,6 +94,25 @@ should not be read as measurements of this library. Supporting them needs N-rema
 Split-K rows are identified by `S > 1` in the table (`S` = number of K segments); their `ours_ms`
 includes the FP32 partial-sum reduce.
 
+### Reproduction under a pinned image (2026-08-03)
+
+The table above was taken under `rocm/atom:latest`, whose ROCm version was never recorded. To show
+it still holds under a toolchain that *can* be reproduced, the same machine (`bg-1w300-k2-3a`) was
+re-run on 2026-08-03 in an image built from `docker/Dockerfile` on the pinned base
+`rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.13_pytorch_release_2.9.1`, with `cat /opt/rocm/.info/version`
+captured literally as **7.0.2**. Median of 3 reps. Raw:
+[`prof_results/bench_mi350x_k2-3a_2026-08-03.txt`](prof_results/bench_mi350x_k2-3a_2026-08-03.txt).
+
+| M × N × K | route | 2026-07-29 | 2026-08-03 | Δ |
+|---|---|---:|---:|---:|
+| 2048 × 6144 × 16128    | 128×384 | 2655.8 | 2651.1 | −0.2% |
+| 2048 × 6144 × 105728   | 128×128 | 1758.6 | 1768.6 | +0.6% |
+| 2048 × 105728 × 1024   | 256×256 | 1423.0 | 1395.0 | −2.0% |
+
+The seven-shape sweep printed by `test_gemm` also agrees within 2%, and all 14 correctness checks
+pass. This is a reproduction of the *absolute* numbers on one machine; it does not repeat the
+interleaved base-vs-new A/B of the 2026-07-29 run, which remains the authority for the 128×384 delta.
+
 ---
 
 ## Performance vs CK MXFP6 (same precision, K=8192)
@@ -125,6 +150,10 @@ Run-to-run jitter ~1–3% (single-shape `bench_all`: latency = best of 50 single
 throughput = best back-to-back ×20). CK columns from the original vs-CK harness — kept as reference,
 so the **ratios** are the reliable takeaway. The S=1 non-split path was A/B-verified unchanged by the
 split-K work (pre-split-K commit built + benched identically, <1% delta).
+
+> The `2048×6144×16128` control row is scoped to this 2026-06-30 split-K experiment and predates the
+> 128×384 route: it shows only that split-K left that shape alone. The shape now routes to 128×384
+> and runs at ~2700 TFLOPs — see the main table and the wide-N A/B below.
 
 **`3490`-K shapes** (`2048×1024×3490`, `2048×2048×3490`) are not direct library inputs (K not a
 multiple of 32); the main table measures them as their zero-padded equivalent (`Kp=3648`), which is
@@ -189,7 +218,7 @@ Calibration boundary (unsplit→split speedup vs r'):
 | 2048×1024×12288 | 4 | 1174 | kept |
 | 2048×1024×16128 | 4 | 1315 | kept |
 | 2048×1024×105728 | 4 | 1466 | kept |
-| 2048×6144×16128 | 1 | 1582 | control unchanged |
+| 2048×6144×16128 | 1 | 1582 | control unchanged (pre-128×384; that shape now routes to 128×384) |
 
 The guard beats a blunt `S≥3` rule: it keeps `1024×3490` (S=2, deep K) which `S≥3` would wrongly
 drop, and would correctly split a hypothetical `S=2 + huge-K` shape. `ALPHA` is per-architecture
@@ -208,11 +237,14 @@ when `k_tiles%S==0`). Verified vs CPU reference on the small uneven analog `2048
 
 ## Wide-N (N=6144) — 128×256 → 128×384, same-machine A/B (MI350X, 2026-07-29)
 
-**Machine:** MI350X (gfx950, 256 CU) `bg-1w300-k2-3a`, image `rocm/atom:latest`,
+**Machine:** MI350X (gfx950, 256 CU) `bg-1w300-k2-3a`, image `rocm/atom:latest` (moving tag, ROCm
+version not recorded — see the caveat at the top of this file),
 `HIP_VISIBLE_DEVICES=0`. **Method:** the `128×256` baseline (`origin/main`) and the `128×384` build
 are compiled from the same source pair in one container invocation and run **interleaved, 3 reps**,
 with CK measured in the same session. M=2048, N=6144, FP16.
-Raw: `prof_results/bench_mi350x_k2-3a_2026-07-29.txt`.
+Raw: `prof_results/bench_mi350x_k2-3a_2026-07-29.txt`. Because both builds ran in the same container
+in the same session, the A/B delta is unaffected by the unrecorded version; only the absolute
+figures depend on it, and those were reproduced on 2026-08-03 under a pinned ROCm 7.0.2 image.
 
 > Why this run exists: every earlier "128×256 → 128×384" delta compared numbers taken on *different*
 > machines. Absolute TFLOPs are not comparable across nodes — only same-session deltas and ratios.
@@ -224,7 +256,8 @@ Raw: `prof_results/bench_mi350x_k2-3a_2026-07-29.txt`.
 | 16128  | 1702 | **2707** | +59.0% | 1654 | 1.03× | **1.64×** |
 | 105728 | 1762 | 1759     | ±0     | 1463 | 1.20× | **1.20×** (control: stays 128×128) |
 
-Median of 3 reps; spread was ≤3% on every cell. These are the interleaved A/B medians, so they
+Median of 3 reps. Spread was ≤1.2% on seven of the eight cells; the exception is 128×384 at
+K=16128 (2707/2760/2666), where it is 3.5%. These are the interleaved A/B medians, so they
 differ by ≤2% from the single-pass numbers in the main table above (962.7 / 2122.1 / 2655.8).
 K=105728 is the control — it is gated out of the
 128×384 route (`Kp < LARGEK_THRESH`) because a 384-column B slice would be 30.5 MB and overflow L2,

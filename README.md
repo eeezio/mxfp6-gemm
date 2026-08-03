@@ -43,44 +43,48 @@ workgroups (**split-K**, see [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) §
 | 2048 × 6144 × 16128  | 1588 | 1586 (no split) | 1 | — | control |
 
 Re-measured on MI350X / ROCm 7.0.2 (2026-06-30). The S=1 (no-split) path is unchanged by the
-split-K work — verified by an A/B build of the pre-split-K commit (<1% delta).
+split-K work — verified by an A/B build of the pre-split-K commit (<1% delta). The last row is a
+control for split-K only and predates the 128×384 route; that shape now runs at ~2700 TFLOPs (see
+[Wide-N shapes](#wide-n-shapes-128384-and-128128-tiles)).
 
 Split-K is enabled inside `gemm()` for workgroup-starved shapes when you supply a scratch buffer
 (sized via `gemm_workspace_size`, see below); shapes that already fill the CUs (e.g. wide N) skip it
 and need no workspace.
 
-### Wide-N large-K shapes (128×128 tile)
+### Wide-N shapes (128×384 and 128×128 tiles)
 
-Wide-N shapes fill the CUs (so split-K does not apply), but at very large K the B working set per
-N-slice overflows L2 and throughput sags — the direct-B ring is left exposed to HBM latency. Routing
-these to a **128×128 tile** halves the B working set per workgroup and restores L2 residency (see
-[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) §9). Measured on **MI350X** (the primary gfx950
-target, `10.7.191.60`), ours + CK in one session, FP16, `2048 × 6144`:
+Wide-N shapes fill the CUs, so split-K does not apply, but the 128×256 tile is wrong for them in two
+different ways depending on K, and each gets its own route (see
+[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) §6, §9):
 
-| M × N × K | CK MXFP8 | before (128×256) | after (128×128) | speedup | after vs CK |
-|---|---:|---:|---:|---:|---:|
-| 2048 × 6144 × 512    | 467  | 716  | 715  | — | 1.53× |
-| 2048 × 6144 × 4096   | 1195 | 1283 | 1332 | — | 1.11× |
-| 2048 × 6144 × 16128  | 1550 | 1588 | 1581 (unchanged, stays 128×256) | — | 1.02× |
-| 2048 × 6144 × 105728 | 1413 | 1260 | **1509** | **1.20×** | **1.07×** (was 0.89×) |
+* **Moderate K → 128×384.** `2048×6144` on 128×256 is 384 workgroups for 256 CUs — 1.5 CU waves, so
+  the second wave runs half empty. A 384-wide tile makes it exactly 256 workgroups (one full wave)
+  and raises accumulators per wave from 8 to 12. Taken only when the wider tile saves a whole CU
+  wave, since its workgroup does 1.5× the work.
+* **Very large K → 128×128.** Here the binding constraint is the cache, not the CU count: the B
+  working set per N-slice overflows L2 and the direct-B ring is left exposed to HBM latency. Halving
+  the N-tile halves the B working set per workgroup and restores L2 residency.
 
-Auto-selected in `choose_tile` only when the cache (not the CU count) is the binding constraint;
-all other shapes are byte-for-byte unchanged.
+Measured on **MI350X** `bg-1w300-k2-3a`, ours + CK in one session, interleaved, FP16, `2048 × 6144`
+(median of 3 reps; raw:
+[`prof_results/bench_mi350x_k2-3a_2026-07-29.txt`](prof_results/bench_mi350x_k2-3a_2026-07-29.txt)):
 
-Cross-checked on **MI355X** (reference node `smci355-ccs-aus-n03-05`, higher-clocked; ours + CK in
-one session, same shapes) — the same fix, with more headroom. (Baseline 1318 and CK 1523 reproduce
-the original reference measurement on this node exactly.)
+| M × N × K | CK MXFP8 | before (128×256) | after | route | after vs CK |
+|---|---:|---:|---:|---|---:|
+| 2048 × 6144 × 512    | 473  | 746  | **966**  | 128×384 | **2.04×** (was 1.58×) |
+| 2048 × 6144 × 4096   | 1290 | 1427 | **2131** | 128×384 | **1.65×** (was 1.11×) |
+| 2048 × 6144 × 16128  | 1654 | 1702 | **2707** | 128×384 | **1.64×** (was 1.03×) |
+| 2048 × 6144 × 105728 | 1463 | 1762 | 1759     | 128×128 | **1.20×** (control: already routed to 128×128, unchanged) |
 
-| M × N × K | CK MXFP8 | ours before | ours after (128×128) | after vs CK |
-|---|---:|---:|---:|---:|
-| 2048 × 6144 × 512    | 505  | 772  | 774  | 1.53× |
-| 2048 × 6144 × 4096   | 1397 | 1509 | 1532 | 1.10× |
-| 2048 × 6144 × 16128  | 1780 | 1771 | 1770 | 0.99× |
-| 2048 × 6144 × 105728 | 1523 | 1318 | **1811** | **1.19×** (was 0.87×) |
-
-The K=105728 fix flips the result from a loss to a win on both GPUs (MI350X 0.89×→1.07×, MI355X
-0.87×→1.19×), with every other shape staying ≥ CK. Full per-track / per-machine data:
+Both routes are auto-selected in `choose_tile`; shapes that meet neither condition are
+byte-for-byte unchanged. The 128×128 route was separately cross-checked on **MI355X**
+(`smci355-ccs-aus-n03-05`, ours + CK in one session) where K=105728 went 1318 → 1811 against CK 1523,
+i.e. 0.87× → 1.19×. Full per-track / per-machine data:
 [`prof_results/experiments-2026-07-16/EXPERIMENT-LOG.md`](prof_results/experiments-2026-07-16/EXPERIMENT-LOG.md).
+
+> Cross-machine absolute TFLOPs are not comparable — only same-session ratios and deltas are. The
+> table above is one machine, one session. Earlier revisions of this section quoted a 128×256 →
+> 128×128 A/B taken on a different node, which is why its K=16128 row read 1.02× rather than 1.64×.
 
 ---
 
@@ -247,15 +251,22 @@ gives a safe scale tail automatically). Same result, but A is padded per-row.
 - **K must be a multiple of 32** (the MX block size). It is then padded internally to `kpad(K)`
   (a multiple of `K_TILE`=192) — pass `kpad(K)` as the kernel's `Kp`. ⚠️ A K that is not a
   multiple of 32 is silently mis-quantized in a release build (the `assert` is compiled out).
-- **M and N must be multiples of 256** (the tile). The small-M path relaxes M to a multiple of
-  128, but 256 is always safe. Pad M/N up otherwise — the grid is launched with integer division,
-  so a non-divisible M/N silently drops the remainder rows/cols.
+- **M and N must be multiples of 256** (the tile) — that is always safe. The 128-wide routes relax
+  this: they need `M%128==0`, and N a multiple of 256 (128×256, 128×128) or 384 (128×384). Pad M/N
+  up otherwise. ⚠️ The grid is launched with integer division and there is **no remainder
+  handling**, so an M/N that no selected tile divides silently drops the remainder rows/cols. This
+  bites hardest on N values that are a multiple of neither 256 nor 384 *and* large enough to fill
+  the CUs (e.g. `N=102272`, where `choose_tile` falls through to 256×256 and the last 128 columns
+  are never written). Check `choose_tile(M,N,Kp).MT/.NT` divide your M/N.
 - **B is transposed by `preprocess_B`.** Pass B in its natural `[K][N]` row-major layout; the
   helper produces `Bᵀ[N][K]` and quantizes it.
 - **Scale grouping must match the tile.** Use `choose_tile(M,N,Kp).MPW` for A's `tile_scale` and
-  `.NPW` for B's, passing the **same padded `Kp` you pass to `gemm()`** — tile choice is K-aware
-  (large-K wide-N routes to 128×128 with different MPW/NPW), so a different `Kp` here silently
-  tiles the scales for the wrong kernel. Mismatched grouping gives wrong results.
+  `.NPW` for B's, passing the **same padded `Kp` you pass to `gemm()`** — tile choice is K-aware, so
+  a different `Kp` here silently tiles the scales for the wrong kernel. Every route has its own
+  `MPW`/`NPW` (256×256 → 4,4; 128×256 → 2,4; 128×128 → 2,2; 128×384 → 4,3), and mismatched grouping
+  gives wrong results with no error. ⚠️ This also means scale layouts are **not portable across
+  library versions**: if a shape's route changes, a cached layout produced by an older `choose_tile`
+  will silently corrupt. Re-run the scale preprocessing whenever you update the library.
 - **`A_row_bytes` / `B_row_bytes`** are the packed bytes per row (= `Quantized.packed_row_bytes`).
   For compact A this is `packed(K)`; for per-row-padded A it is `packed(Kp)`.
 - **E8M0 scale `0xFF` is NaN** and will poison the **entire** output (`0·NaN = NaN`). This is the
@@ -302,9 +313,9 @@ template <int M_TILE, int N_TILE, int K_TILE, int WAVES_M, int WAVES_N, int MIN_
 
 | Param | Default | Meaning |
 |---|---|---|
-| `M_TILE` × `N_TILE` | 256×256 / 128×256 / 128×128 | Register accumulator tile per workgroup. Larger ⇒ higher arithmetic intensity (AI) but fewer workgroups. The live shape knob (`choose_tile`): 256×256 for CU-filling shapes, 128×256 for WG-starved small-M, 128×128 for large-K wide-N (shrinks B working set to fit L2). |
+| `M_TILE` × `N_TILE` | 256×256 / 128×384 / 128×256 / 128×128 | Register accumulator tile per workgroup. Larger ⇒ higher arithmetic intensity (AI) but fewer workgroups. The live shape knob (`choose_tile`): 256×256 for CU-filling shapes, 128×256 for WG-starved small-M, 128×384 for moderate-K wide-N (removes wave quantization, 12 acc/wave), 128×128 for large-K wide-N (shrinks B working set to fit L2). |
 | `K_TILE` | 192 | Deep-K tile depth = size of the MFMA window backing one load. Bigger window hides load latency. `subs = K_TILE/64`. |
-| `WAVES_M` × `WAVES_N` | 2×2 | How the tile is split across the block's 4 waves → per-wave block shape `MPW×NPW` = `(M_TILE/32/WAVES_M)×(N_TILE/32/WAVES_N)`. Sets the load-vs-MFMA ratio (perimeter vs area) and input VGPR. |
+| `WAVES_M` × `WAVES_N` | 2×2 (1×4 for 128×384) | How the tile is split across the block's 4 waves → per-wave block shape `MPW×NPW` = `(M_TILE/32/WAVES_M)×(N_TILE/32/WAVES_N)`. Sets the load-vs-MFMA ratio (perimeter vs area) and input VGPR. 128×384 must use 1×4: 2×2 would give `N_PW=6` and trip the `NPW≤4` scale assert. |
 | `MIN_OCC` | 1 | Occupancy floor (`__launch_bounds__` 2nd arg). occ1 holds the largest tile; occ2 forces a smaller AI (see coupling). |
 | `SWZ` | 0 | Workgroup-ID swizzle width for L2 locality (`0` = off). Functional but currently always `0` from the dispatcher (swz0 is best on this machine). |
 | `OutT` | — | Output element type (`float` / `__half` / `__hip_bfloat16`), set by `gemm()`. |
@@ -348,7 +359,13 @@ correctness guard whose only safe value is `true`).
 
 ## Testing
 
-`ctest` (i.e. `test_gemm`) is the correctness gate: fresh-allocated, `0x5A`-poisoned outputs
-compared against a CPU reference, on both tile paths (256×256 and 128×256), including
-non-square / partial-grid / `k_tiles==1`, and the compact-A recipe (`verify_compact`). It also
-prints an indicative FP16 performance sweep (let it reach steady state before trusting the numbers).
+`ctest` runs two gates:
+
+* **`gemm`** (`test_gemm`) — the correctness gate: fresh-allocated, `0x5A`-poisoned outputs compared
+  against a CPU reference on all four tile paths (256×256, 128×384, 128×256, 128×128), including
+  non-square / partial-grid / `k_tiles==1`, split-K, and the compact-A recipe (`verify_compact`).
+  Needs a GPU. It also prints an indicative FP16 performance sweep (let it reach steady state before
+  trusting the numbers).
+* **`routing`** (`test_gemm --routing`) — checks `choose_tile`'s decisions against a table of 18
+  shapes. This is **host-only and needs no GPU**, because the kernel-level checks above force a tile
+  via `gemm_force_tile()` and so never exercise the routing decision itself.
