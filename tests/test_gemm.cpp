@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -248,6 +249,48 @@ static bool verify_128x384(int M, int N, int K) {
     return ok;
 }
 
+static bool check_routing() {
+    struct Case {
+        int M, N, K, MT, NT;
+        const char* why;
+    };
+    // clang-format off
+    static const Case cases[] = {
+        {2048,  6144, 16128, 128, 384, "wave 2->1, measured 1.59x"},
+        {2048,  6144,   512, 128, 384, "same, small K"},
+        {4096,  3072, 16128, 128, 384, "wg384=256"},
+        {8192,  1536, 16128, 128, 384, "wg384=256"},
+        {16384,  768, 16128, 128, 384, "wg384=256"},
+        {1024, 12288, 16128, 128, 384, "wg384=256"},
+        {2048,  6912, 16128, 128, 256, "wg384=288 -> 2 waves, no saving"},
+        {2048,  7680, 16128, 128, 256, "wg384=320 -> 2 waves, no saving"},
+        {4096,  3840, 16128, 128, 256, "wg384=320 -> 2 waves, no saving"},
+        {1024, 15360, 16128, 128, 256, "wg384=320 -> 2 waves, no saving"},
+        {2048,  6528, 16128, 128, 384, "N%256!=0, only non-truncating route"},
+        {2048,  7296, 16128, 128, 384, "N%256!=0, only non-truncating route"},
+        {2048,  6144, 105728, 128, 128, "large-K wide-N keeps priority over 128x384"},
+        {2048,  1024,  16128, 128, 256, "narrow N"},
+        {2048,  4096,   4096, 128, 256, "N%384!=0"},
+        {2048, 16384,   1024, 256, 256, "wg256 >= CU"},
+        {2048, 20480,   6144, 256, 256, "wg256 >= CU"},
+        {4096,  4096,    768, 256, 256, "wg256 >= CU"},
+    };
+    // clang-format on
+    int bad = 0;
+    for (const Case& c : cases) {
+        TileChoice tc = choose_tile(c.M, c.N, kpad(c.K));
+        bool ok = tc.MT == c.MT && tc.NT == c.NT;
+        if (!ok) {
+            printf("  route %5dx%6dx%6d : got %3dx%3d want %3dx%3d  FAIL<<<  (%s)\n", c.M, c.N,
+                   c.K, tc.MT, tc.NT, c.MT, c.NT, c.why);
+            bad++;
+        }
+    }
+    printf("  choose_tile routing: %d/%d %s\n", (int)(sizeof(cases) / sizeof(*cases)) - bad,
+           (int)(sizeof(cases) / sizeof(*cases)), bad ? "FAIL<<<" : "OK");
+    return bad == 0;
+}
+
 static void perf(int M, int N, int K) {
     int Kp_est = ((K + K_TILE - 1) / K_TILE) * K_TILE;
     TileChoice tc = choose_tile(M, N, Kp_est);
@@ -272,6 +315,7 @@ static void perf(int M, int N, int K) {
     teardown(x);
 }
 int main(int argc, char** argv) {
+    if (argc >= 2 && strcmp(argv[1], "--routing") == 0) return check_routing() ? 0 : 1;
     if (argc >= 4) {
         int M = atoi(argv[1]), N = atoi(argv[2]), K = atoi(argv[3]);
         perf(M, N, K);
@@ -279,6 +323,7 @@ int main(int argc, char** argv) {
     }
     printf("=== libmxfp6gemm correctness (end-to-end, CPU ref) ===\n");
     int f = 0;
+    f += !check_routing();
     f += !verify(512, 512, 768);    // -> 128x256 path (wg256<CU)
     f += !verify(768, 1280, 960);   // -> 128x256, non-square
     f += !verify(4096, 4096, 768);  // -> 256x256 path (wg256=256), small K for fast ref

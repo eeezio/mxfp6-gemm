@@ -25,14 +25,18 @@ TileChoice choose_tile(int M, int N, int Kp) {
         if (wg128 >= CU)
             return {128, 128, 2, 2};  // large-K wide-N: halve B working-set per WG
     }
-    // 128x384 path: perfect CU fill (wg=256 exactly) with 12 acc per wave.
+    // 128x384 path: 12 acc per wave, taken when it saves a whole CU wave over 128x256.
     // Requires WAVES_M=1, WAVES_N=4 so N_PW=3 satisfies the scale static_assert (N_PW<=4).
     // Compute per B-slot = 1152/9 = 128 cyc (vs 64 for 128x256), so PFD=5 covers 640 cyc.
     // Only activates for moderate K (B-slice = 384*Kp*0.75; at LARGEK_THRESH=32768 this is
     // 9.4MB, past L2 — so we gate Kp < LARGEK_THRESH and let 128x128 handle the rest).
     if (wg256 < CU && (M % 128) == 0 && (N % 384) == 0 && Kp < LARGEK_THRESH) {
         int wg384 = (M / 128) * (N / 384);
-        if (wg384 >= CU)
+        int wg256_grid = (M / 128) * (N / 256);
+        bool saves_a_wave =
+            wg384 >= CU && 3 * ((wg384 + CU - 1) / CU) < 2 * ((wg256_grid + CU - 1) / CU);
+        bool only_exact_route = (N % 256) != 0;
+        if (saves_a_wave || only_exact_route)
             return {128, 384, 4, 3};  // WAVES_M=1, WAVES_N=4, MPW=4, NPW=3
     }
     if (wg256 < CU && (M % 128) == 0 && (N % 256) == 0)
