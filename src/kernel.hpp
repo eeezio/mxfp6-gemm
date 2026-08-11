@@ -71,9 +71,9 @@ __device__ __forceinline__ void issue_A_chunks(uint32_t lds_base, int row_stride
 //   STRIDE=1, PER=1, STOP=NB. ADRIP_START=0 reproduces the original front-loaded schedule;
 //   batching (PER>=2) was swept and lost. swz0 stays best for drip-A (swz32 did not help).
 template <int M_TILE, int N_TILE, int K_TILE, int WAVES_M, int WAVES_N, int MIN_OCC = 1,
-          int SWZ = 0, typename OutT = float, bool SPLITK = false, int PFD = 5,
-          bool HARD_WAIT = true, int ADRIP_START = 1, int ADRIP_STRIDE = 1, int ADRIP_PER = 1,
-          int ADRIP_STOP = 0>
+          int SWZ = 0, typename OutT = float, bool SPLITK = false, bool KGE2 = false,
+          int PFD = 5, bool HARD_WAIT = true, int ADRIP_START = 1, int ADRIP_STRIDE = 1,
+          int ADRIP_PER = 1, int ADRIP_STOP = 0>
 __global__ void __launch_bounds__(256, MIN_OCC)
     lds_gemm_hybrid_dripA(const void* __restrict__ A, const void* __restrict__ B,
                           const uint8_t* __restrict__ sA, const uint8_t* __restrict__ sB,
@@ -205,6 +205,7 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     issue_A_chunks<ROW_CHUNKS, M_TILE * ROW_CHUNKS>(0, A_row_bytes, kt_base * KT_BYTES, wave, lane,
                                                     arsrc, 0, ISSUES_A);
     int kt = 0;
+    if constexpr (KGE2) __builtin_assume(k_tiles_seg >= 2);
     for (; kt + 1 < k_tiles_seg; kt += 2) {
         if (HARD_WAIT) wait_vmcnt(0);
         __syncthreads();

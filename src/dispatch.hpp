@@ -53,10 +53,10 @@ inline size_t splitk_workspace_bytes(int M, int N, int Kp) {
 // ws/ws_bytes: caller-provided split-K workspace (see gemm_workspace_size). If a WG-starved shape
 // would split but ws is null or too small, split is skipped (the result is still correct, just
 // without the speedup) and a warning is logged to stderr.
-template <typename OutT>
-inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh,
-                          const uint8_t* dsA, const uint8_t* dsB, OutT* dD, int A_row_bytes,
-                          int B_row_bytes, void* ws, size_t ws_bytes) {
+template <typename OutT, bool KGE2>
+inline void dispatch_gemm_kge(int M, int N, int Kp, const void* dA, const void* dBsh,
+                              const uint8_t* dsA, const uint8_t* dsB, OutT* dD, int A_row_bytes,
+                              int B_row_bytes, void* ws, size_t ws_bytes) {
     constexpr int KT = K_TILE;
     dim3 blk(256);
     int kit = Kp / 64;
@@ -75,29 +75,33 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
             S = 1;
         }
     }
-    if (S > 1) {
-        int seg_floor = k_tiles / S, seg_rem = k_tiles % S;
-        size_t total = (size_t)M * N;
-        float* Dpart = static_cast<float*>(ws);
-        // Only the 128x256 and 256x256 tiles are implemented here; splitk_S() returns S=1 for
-        // every other tile so this branch cannot be reached with one.
-        if (tc.MT == 128) {
-            dim3 g(M / 128, N / 256, S);
-            int lds = 2 * (128 * (KT * 6 / 8));
-            lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, true>
-                <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
-                                  seg_floor, seg_rem, Dpart);
-        } else {
-            dim3 g(M / 256, N / 256, S);
-            int lds = 2 * (256 * (KT * 6 / 8));
-            lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, 0, OutT, true>
-                <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
-                                  seg_floor, seg_rem, Dpart);
+    // split-K only exists in the KGE2 arm: splitk_S floors every segment at 8 tiles, so any
+    // shape that splits already has k_tiles_seg >= 8.
+    if constexpr (KGE2) {
+        if (S > 1) {
+            int seg_floor = k_tiles / S, seg_rem = k_tiles % S;
+            size_t total = (size_t)M * N;
+            float* Dpart = static_cast<float*>(ws);
+            // Only the 128x256 and 256x256 tiles are implemented here; splitk_S() returns S=1 for
+            // every other tile so this branch cannot be reached with one.
+            if (tc.MT == 128) {
+                dim3 g(M / 128, N / 256, S);
+                int lds = 2 * (128 * (KT * 6 / 8));
+                lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, true, KGE2>
+                    <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
+                                      seg_floor, seg_rem, Dpart);
+            } else {
+                dim3 g(M / 256, N / 256, S);
+                int lds = 2 * (256 * (KT * 6 / 8));
+                lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, 0, OutT, true, KGE2>
+                    <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
+                                      seg_floor, seg_rem, Dpart);
+            }
+            int threads = 256;
+            long red_blocks = ((long)total + threads - 1) / threads;
+            reduce_splitk<OutT><<<dim3((unsigned)red_blocks), dim3(threads)>>>(Dpart, dD, (long)total, S);
+            return;
         }
-        int threads = 256;
-        long red_blocks = ((long)total + threads - 1) / threads;
-        reduce_splitk<OutT><<<dim3((unsigned)red_blocks), dim3(threads)>>>(Dpart, dD, (long)total, S);
-        return;
     }
     if (tc.MT == 128 && tc.NT == 128) {
         // 128x128 tile: large-K wide-N path. Beats 128x256 by dropping the half-empty second CU
@@ -105,7 +109,7 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
         // B/N-slice is 10.16 MB against a 4 MB L2. NB=6 (vs 12 for 128x256).
         dim3 g(M / 128, N / 128);
         int lds = 2 * (128 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<128, 128, KT, 2, 2, 1, 0, OutT, false>
+        lds_gemm_hybrid_dripA<128, 128, KT, 2, 2, 1, 0, OutT, false, KGE2>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     } else if (tc.MT == 128 && tc.NT == 384) {
@@ -114,7 +118,7 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
         // NB=9 but compute/B-slot = 1152/9 = 128 cyc (vs 64 for 128x256) → deeper look-ahead.
         dim3 g(M / 128, N / 384);
         int lds = 2 * (128 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<128, 384, KT, 1, 4, 1, 0, OutT, false>
+        lds_gemm_hybrid_dripA<128, 384, KT, 1, 4, 1, 0, OutT, false, KGE2>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     } else if (tc.MT == 128) {
@@ -130,29 +134,44 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
         // ~2-3% by covering more HBM-miss latency; below that PFD=5 stays best (deeper ring
         // costs ~1-2% in the L2-hit regime).
         if (Kp > 50000) {
-            lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, false, 7>
+            lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, false, KGE2, 7>
                 <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                                   0, k_tiles, nullptr);
         } else {
-            lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, false, 5>
+            lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, false, KGE2, 5>
                 <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                                   0, k_tiles, nullptr);
         }
     } else {
         dim3 g(M / 256, N / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, 0, OutT, false>
+        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, 0, OutT, false, KGE2>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     }
 }
 
+// k_tiles_seg < 2 only happens at Kp == K_TILE (splitk_S floors every segment at 8 tiles), so the
+// KGE2 arm covers every other shape and lets the compiler drop the loop guard -- which is what
+// stops it emitting the accumulator zero-init twice.
+template <typename OutT>
+inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh,
+                          const uint8_t* dsA, const uint8_t* dsB, OutT* dD, int A_row_bytes,
+                          int B_row_bytes, void* ws, size_t ws_bytes) {
+    if (Kp >= 2 * K_TILE)
+        dispatch_gemm_kge<OutT, true>(M, N, Kp, dA, dBsh, dsA, dsB, dD, A_row_bytes, B_row_bytes,
+                                      ws, ws_bytes);
+    else
+        dispatch_gemm_kge<OutT, false>(M, N, Kp, dA, dBsh, dsA, dsB, dD, A_row_bytes, B_row_bytes,
+                                       ws, ws_bytes);
+}
+
 // Like dispatch_gemm but uses a caller-supplied TileChoice instead of choose_tile(). No split-K.
 // Used by gemm_force_tile() to exercise a specific kernel path on small shapes for testing.
-template <typename OutT>
-inline void dispatch_gemm_force_tile(int M, int N, int Kp, TileChoice tc, const void* dA,
-                                     const void* dBsh, const uint8_t* dsA, const uint8_t* dsB,
-                                     OutT* dD, int A_row_bytes, int B_row_bytes) {
+template <typename OutT, bool KGE2>
+inline void dispatch_gemm_force_tile_kge(int M, int N, int Kp, TileChoice tc, const void* dA,
+                                         const void* dBsh, const uint8_t* dsA, const uint8_t* dsB,
+                                         OutT* dD, int A_row_bytes, int B_row_bytes) {
     constexpr int KT = K_TILE;
     dim3 blk(256);
     int kit = Kp / 64;
@@ -160,28 +179,40 @@ inline void dispatch_gemm_force_tile(int M, int N, int Kp, TileChoice tc, const 
     if (tc.MT == 128 && tc.NT == 128) {
         dim3 g(M / 128, N / 128);
         int lds = 2 * (128 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<128, 128, KT, 2, 2, 1, 0, OutT, false>
+        lds_gemm_hybrid_dripA<128, 128, KT, 2, 2, 1, 0, OutT, false, KGE2>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     } else if (tc.MT == 128 && tc.NT == 384) {
         dim3 g(M / 128, N / 384);
         int lds = 2 * (128 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<128, 384, KT, 1, 4, 1, 0, OutT, false>
+        lds_gemm_hybrid_dripA<128, 384, KT, 1, 4, 1, 0, OutT, false, KGE2>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     } else if (tc.MT == 128) {
         dim3 g(M / 128, N / 256);
         int lds = 2 * (128 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, false>
+        lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, false, KGE2>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     } else {
         dim3 g(M / 256, N / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, 0, OutT, false>
+        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, 0, OutT, false, KGE2>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     }
+}
+
+template <typename OutT>
+inline void dispatch_gemm_force_tile(int M, int N, int Kp, TileChoice tc, const void* dA,
+                                     const void* dBsh, const uint8_t* dsA, const uint8_t* dsB,
+                                     OutT* dD, int A_row_bytes, int B_row_bytes) {
+    if (Kp >= 2 * K_TILE)
+        dispatch_gemm_force_tile_kge<OutT, true>(M, N, Kp, tc, dA, dBsh, dsA, dsB, dD, A_row_bytes,
+                                                 B_row_bytes);
+    else
+        dispatch_gemm_force_tile_kge<OutT, false>(M, N, Kp, tc, dA, dBsh, dsA, dsB, dD, A_row_bytes,
+                                                  B_row_bytes);
 }
 
 }  // namespace detail

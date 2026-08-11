@@ -315,3 +315,33 @@ first as an answer to the second: B's slice does overflow L2, so shrinking it *l
 and the tile that shrank it *was* faster — for an unrelated reason. The wider tile, which overflows
 L2 three times harder, is faster still.
 
+---
+
+## 10. Shallow-K fixed cost: emitting the accumulator zero-init once
+
+**What**: `dispatch_gemm` picks one of two compile-time template arms on a host-known predicate,
+`Kp >= 2*K_TILE`. Inside the `KGE2=true` arm the kernel asserts `__builtin_assume(k_tiles_seg >= 2)`,
+which lets LLVM drop the `k_tiles_seg < 2` guard on the main k-loop.
+
+**Why**: with the guard present the compiler emits the 256-instruction accumulator clear **twice** on
+the main path — two blocks of `v_accvgpr_write_b32`, one on each side of the `s_cmp_lt_i32 s25, 2`
+loop guard, both writing exactly `a0..a255`, with nothing touching AGPRs between them. Both execute.
+The assumption is sound rather than wishful: `k_tiles_seg < 2` can only happen at `Kp == K_TILE`,
+because `splitk_S()` floors every split segment at 8 deep tiles, so any shape that splits already has
+`k_tiles_seg >= 8`.
+
+The saving is a **fixed ~1024 cycles per wave**, so it is a shallow-K optimization by construction —
+worth ~2.7% at `K=1024` and 0.009% at `K=105728`. Measured on MI350X: **+2.76%** on
+`2048×105728×1024` and **+2.63%** on `2048×102272×1024`, neutral elsewhere.
+
+**Cost**: kernel instantiations go 24 → 39 and `libmxfp6gemm.a` grows from 452 kB to ~700 kB. That is
+the whole price — no register, occupancy or scratch change (all 39 kernels keep `ScratchSize 0`,
+zero spill).
+
+> **Every zero-cost formulation was tried and failed.** Wrapping the loop in a tautological
+> `if (k_tiles_seg >= 2)`, manual loop rotation (`if` + `do-while`), `__builtin_amdgcn_sched_barrier(0)`,
+> an `asm` tie on the accumulator, and sinking the `clear_acc` loop below the prologue all leave the
+> instruction count unchanged — LLVM canonicalizes every one of them back. Removing the branch at
+> *compile* time is the only mechanism that works, and paying for it with a template arm is the
+> reason this is a dispatch-level change rather than a one-line kernel edit.
+
