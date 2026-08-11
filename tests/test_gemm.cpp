@@ -96,7 +96,9 @@ static void teardown(Dev& x) {
     hipFree(x.dsB);
 }
 
-static bool verify(int M, int N, int K) {
+// force_ws: hand gemm() a split-K workspace even when gemm_workspace_size() says none is needed,
+// so a route that must not split is checked under the same call shape a splitting caller uses.
+static bool verify(int M, int N, int K, bool force_ws = false) {
     int Kp_est = ((K + K_TILE - 1) / K_TILE) * K_TILE;
     TileChoice tc = choose_tile(M, N, Kp_est);
     Dev x = setup(M, N, K, tc);
@@ -107,6 +109,7 @@ static bool verify(int M, int N, int K) {
     hipMemset(dD, 0x5A, (size_t)M * N * 4);
     void* ws = nullptr;
     size_t wsb = gemm_workspace_size(M, N, x.Kp);
+    if (!wsb && force_ws) wsb = (size_t)4 * M * N * sizeof(float);
     if (wsb) hipMalloc(&ws, wsb);
     gemm(OutType::F32, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb);
     hipDeviceSynchronize();
@@ -120,7 +123,8 @@ static bool verify(int M, int N, int K) {
         mx = fmaxf(mx, fabsf(Dref[i]));
     }
     bool ok = er < 2e-2f * fmaxf(1.f, mx);
-    printf("  %4dx%4dx%4d -> %dx%d : %s\n", M, N, K, tc.MT, tc.NT, ok ? "OK" : "FAIL<<<");
+    printf("  %4dx%4dx%4d -> %dx%d%s : %s\n", M, N, K, tc.MT, tc.NT, force_ws ? " +ws" : "",
+           ok ? "OK" : "FAIL<<<");
     teardown(x);
     return ok;
 }
@@ -288,7 +292,27 @@ static bool check_routing() {
     }
     printf("  choose_tile routing: %d/%d %s\n", (int)(sizeof(cases) / sizeof(*cases)) - bad,
            (int)(sizeof(cases) / sizeof(*cases)), bad ? "FAIL<<<" : "OK");
-    return bad == 0;
+
+    // The split path only implements 128x256/256x256, so a shape routed to any other tile must
+    // come back with no workspace. These three all split before the guard: the 2688/5760 pair
+    // faulted on the GPU, the 128x384 one returned garbage.
+    struct NoSplit {
+        int M, N, K;
+    };
+    static const NoSplit ns[] = {{128, 384, 3072}, {2048, 2688, 24576}, {2048, 5760, 16128}};
+    int sbad = 0;
+    for (const NoSplit& c : ns) {
+        int Kp = kpad(c.K);
+        TileChoice tc = choose_tile(c.M, c.N, Kp);
+        if ((tc.NT == 384 || tc.NT == 128) && gemm_workspace_size(c.M, c.N, Kp) != 0) {
+            printf("  split %5dx%6dx%6d : %dx%d must not split  FAIL<<<\n", c.M, c.N, c.K, tc.MT,
+                   tc.NT);
+            sbad++;
+        }
+    }
+    printf("  split-K tile guard: %d/%d %s\n", (int)(sizeof(ns) / sizeof(*ns)) - sbad,
+           (int)(sizeof(ns) / sizeof(*ns)), sbad ? "FAIL<<<" : "OK");
+    return bad == 0 && sbad == 0;
 }
 
 static void perf(int M, int N, int K) {
@@ -344,6 +368,12 @@ int main(int argc, char** argv) {
     // 256x384x768: grid 2x1 WGs, k_tiles=4. 384x768x960: grid 3x2 WGs, k_tiles=5.
     f += !verify_128x384(256, 384, 768);
     f += !verify_128x384(384, 768, 960);
+    // Routed (not forced) 128x384 on a WG-starved grid deep enough to tempt split-K: wg384=1,
+    // k_tiles=16. Before the splitk_S guard this ran a 128x256 kernel against NPW=3 scales and
+    // wrote only 256 of the 384 columns. Run twice: once as a normal caller, once handing over a
+    // workspace anyway, which is the call shape that triggered the corruption.
+    f += !verify(128, 384, 3072);
+    f += !verify(128, 384, 3072, /*force_ws=*/true);
     if (f) {
         printf("  CORRECTNESS FAILED\n");
         return 1;
