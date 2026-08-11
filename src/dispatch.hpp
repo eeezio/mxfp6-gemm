@@ -23,6 +23,16 @@ namespace detail {
 // 128x128 and the unmeasured 128x256 therefore stay unswizzled.
 constexpr int SWZ_XCD = -1;
 
+// B-ring depth on the 256x256 route. PFD=5 is the default everywhere; at very wide N a deeper
+// ring (8) is worth +5.5~6.7% (interleaved A/B, ranges disjoint, N=81920/102272/105728, K=1024
+// through 4096). It is NOT a free win: the same route LOSES at smaller N (-1.05% at N=16128,
+// -2.3% at 8192^3, -3.5% at 4096^3), so the gate is required, not a precaution. The threshold is
+// EMPIRICAL -- measured wins start at N=81920 and everything at N<=65536 was noise or loss. K is
+// not part of it: at N=105728 the win holds from 6 to 22 k-tiles. Why N is the discriminator is
+// not established; the obvious "B stops fitting L2" story fails to separate 8192^3 (loses) from
+// N=65536 K=1024 (same 50 MB of B, noise).
+constexpr int BRING8_MIN_N = 81920;
+
 // Split factor S for (M,N,Kp): the number of K-segments to split across independent workgroups
 // for a WG-starved shape (S==1 means "do not split"). SINGLE SOURCE OF TRUTH — both the public
 // gemm_workspace_size() query and dispatch_gemm() call this so the workspace a caller sizes always
@@ -159,16 +169,29 @@ inline void dispatch_gemm_kge(int M, int N, int Kp, const void* dA, const void* 
         // half of one N-tile (measured 1274 vs 1455 TFLOPs on 2048x102272x1024).
         dim3 g(M / 256, (N + 255) / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, 5, true, 1, 1, 1,
-                              0, true>
-            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
-                              0, k_tiles, nullptr);
+        if (N >= BRING8_MIN_N) {
+            lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, 8, true, 1, 1,
+                                  1, 0, true>
+                <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
+                                  0, k_tiles, nullptr);
+        } else {
+            lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, 5, true, 1, 1,
+                                  1, 0, true>
+                <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
+                                  0, k_tiles, nullptr);
+        }
     } else {
         dim3 g(M / 256, N / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2>
-            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
-                              0, k_tiles, nullptr);
+        if (N >= BRING8_MIN_N) {
+            lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, 8>
+                <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
+                                  0, k_tiles, nullptr);
+        } else {
+            lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, 5>
+                <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
+                                  0, k_tiles, nullptr);
+        }
     }
 }
 
@@ -224,7 +247,9 @@ inline void dispatch_gemm_force_tile_kge(int M, int N, int Kp, TileChoice tc, co
     } else {
         dim3 g(M / 256, N / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2>
+        // Not gated on BRING8_MIN_N like the routed path: force-tile callers are all small
+        // correctness shapes, so the deep-ring arm is unreachable from here.
+        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, 5>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     }
