@@ -272,16 +272,19 @@ static bool check_routing() {
         {1024, 15360, 16128, 128, 256, "wg384=320 -> 2 waves, no saving"},
         {2048,  6528, 16128, 128, 384, "N%256!=0, only non-truncating route"},
         {2048,  7296, 16128, 128, 384, "N%256!=0, only non-truncating route"},
-        // N%256!=0 outside the perf arms' gates: the exact route is a correctness floor, so it
-        // must survive both large Kp (the 128x384 arm is K-gated) and a CU-filling grid (it is
-        // also wg256<CU-gated). All four used to fall through to 256x256 and drop 128 columns.
-        {  256,   384, 32768, 128, 384, "large Kp, wg128<CU: exact route is not K-gated"},
+        // N%256!=0 outside every perf arm's gate: the divisibility floor has to catch these, since
+        // the wave-saving arm needs wg384>=CU, the 128x128 arm needs wg128>=CU, and neither is
+        // reachable here. All four used to fall through to 256x256 and drop 128 columns.
+        {  256,   384, 32768, 128, 384, "wg384=2, wg128=6: only the floor covers N"},
         {  128,   384, 32768, 128, 384, "same, and 256x256 would launch a 0-wide grid"},
-        { 8192,  6528,  4096, 128, 384, "wg256=800>=CU: exact route is not CU-fill-gated"},
-        { 4096,  7296, 32768, 128, 384, "both gates missed at once"},
+        { 8192,  6528,  4096, 128, 384, "wg256=800>=CU, so wide384 is false: floor covers N"},
+        { 4096,  7296, 32768, 128, 384, "CU-filling and large K at once"},
         // M an odd multiple of 128 on a CU-filling grid: 256x256 would drop the last 128 rows.
         {  896, 22272,  4096, 128, 256, "M%256!=0 falls back to a tile that divides M"},
-        {2048,  6144, 105728, 128, 128, "large-K wide-N keeps priority over 128x384"},
+        {2048,  6144, 105728, 128, 384, "wave-saving 128x384 is not K-gated (measured +44%)"},
+        { 512, 24576, 105728, 128, 384, "same wg384=256 family, large K"},
+        {2048,  4096, 105728, 128, 128, "large-K wide-N, N%384!=0 -> 128x128"},
+        {2048,  2688, 105728, 128, 128, "N%256!=0 but wg384<CU: 128x128 wins before the floor"},
         {2048,  1024,  16128, 128, 256, "narrow N"},
         {2048,  4096,   4096, 128, 256, "N%384!=0"},
         {2048, 16384,   1024, 256, 256, "wg256 >= CU"},

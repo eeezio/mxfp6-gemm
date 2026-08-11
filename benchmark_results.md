@@ -259,9 +259,12 @@ figures depend on it, and those were reproduced on 2026-08-03 under a pinned ROC
 Median of 3 reps. Spread was ≤1.2% on seven of the eight cells; the exception is 128×384 at
 K=16128 (2707/2760/2666), where it is 3.5%. These are the interleaved A/B medians, so they
 differ by ≤2% from the single-pass numbers in the main table above (962.7 / 2122.1 / 2655.8).
-K=105728 is the control — it is gated out of the
-128×384 route (`Kp < LARGEK_THRESH`) because a 384-column B slice would be 30.5 MB and overflow L2,
-so it keeps the 128×128 route and is byte-for-byte identical. `base/CK` at K=16128 = 1.03×
+K=105728 was the control in this run: the 128×384 route was then gated on `Kp < LARGEK_THRESH`, on
+the theory that a 30.5 MB B slice would overflow L2, so the shape kept 128×128 and was byte-for-byte
+identical. **That gate has since been shown backwards** — forcing 128×384 at this K measured 35–41%
+*faster* than 128×128, the wave-saving arm is no longer K-gated, and the shape now routes to 128×384
+at 2557 TFLOPs (2026-08-11, same machine, clocks locked, n=3, CK re-run in the same session). See `docs/OPTIMIZATIONS.md §9`.
+`base/CK` at K=16128 = 1.03×
 reproduces the historical 1.02× for this shape, which is the check that the baseline is sound.
 
 The gain compounds three effects: wave quantization removed (384 WGs / 1.5 waves → 256 WGs /
@@ -296,12 +299,14 @@ section previously quoted is retained raw in `prof_results/bench_mi350x_10.7.191
    `2048×3490` 0.61×. (`512×6144` was in this list; the uneven split-K now takes it to 1.00×.)
 4. **Small N + small K is overhead-bound** — N≤256 with small K sit at ~40 kernel TFLOPs and a
    ~5 µs latency floor. Fixed launch/prologue cost dominates; split-K cannot help.
-5. ~~**Wide-N very-large-K L2 sag**~~ — **RESOLVED (PR #4).** `2048×6144×105728` was 1288 TF (0.90×
-   CK). Root cause: B/N-slice (256 cols × K × 0.75 = 20.3 MB) overflows L2 → capacity/BW-bound (not
-   latency-bound). Fixed by routing to a **128×128 tile** (halves B slice to 10.2 MB). MI350X result:
-   **1.20× CK**; MI355X **1.19× CK**. See `docs/OPTIMIZATIONS.md §9` and `prof_results/bench_mi350x_*.txt`.
+5. ~~**Wide-N very-large-K L2 sag**~~ — **RESOLVED.** `2048×6144×105728` was 1288 TF (0.90× CK).
+   PR #4 routed it to a **128×128 tile** → MI350X **1.20× CK**, MI355X **1.19× CK**. The stated
+   reason (halving the B slice to fit L2) was **wrong**: 10.2 MB does not fit a 4 MB per-XCD L2
+   either, and the win was the dropped half-empty CU wave. Removing the K-gate on the wave-saving
+   128×384 arm then took the same shape to **2557 TF (+44.7%)** with a 3× *larger* B slice.
+   See `docs/OPTIMIZATIONS.md §9` and `prof_results/bench_mi350x_*.txt`.
 6. **Split-K's own ceiling** — the FP32 partial-sum write + reduce round-trip caps speedup well below the ideal `S×` (2.99× of an ideal 4× for 105728).
-7. ~~**Wide-N moderate-K wave quantization**~~ — **RESOLVED.** `2048×6144×{512,4096,16128}` ran
-   384 WGs on 256 CUs (1.5 waves). Routing `N%384==0` moderate-K shapes to a **128×384 tile** gives
-   exactly 256 WGs; +29%/+49%/+59% and 1.64–2.04× CK. The N=6144 shapes that still trail are gone;
-   remaining N=6144 work is the large-K `128×128` route at 1.20× CK.
+7. ~~**Wide-N wave quantization**~~ — **RESOLVED.** `2048×6144×{512,4096,16128}` ran 384 WGs on
+   256 CUs (1.5 waves). Routing `N%384==0` shapes to a **128×384 tile** gives exactly 256 WGs;
+   +29%/+49%/+59% and 1.64–2.04× CK. The gate was later found to apply at large K too (item 5), so
+   every N=6144 shape now takes this route.

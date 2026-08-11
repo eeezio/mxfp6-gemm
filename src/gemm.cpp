@@ -12,40 +12,47 @@ namespace mxfp6 {
 TileChoice choose_tile(int M, int N, int Kp) {
     constexpr int CU = 256;  // MI350X (gfx950)
     int wg256 = (M / 256) * (N / 256);
-    // 128x128 path: large-K wide-N where the 128x256 tile's per-WG B working-set
-    // (256 cols * Kp * 0.75 B) exceeds L2, but halving NT to 128 may improve residency.
-    // Guard: shape must be 128x128-grid-valid AND Kp is known AND large enough.
-    // Threshold: Kp >= 32768 (= K > ~22K fp6-effective; chosen to activate at the
-    // 105728-padded shapes observed to be L2-miss dominated at N=6144).
+    // 128x128 path: the large-K wide-N shapes 128x384 cannot take. It beats 128x256 by dropping
+    // the half-empty second CU wave, NOT by fitting B in L2 (a 128-col B/N-slice is 10.16 MB
+    // against a 4 MB L2). Guard: shape must be 128x128-grid-valid AND Kp known AND large enough.
+    // Threshold: Kp >= 32768, chosen to activate at the 105728-padded shapes at N=6144.
     constexpr int LARGEK_THRESH = 32768;
-    if (wg256 < CU && (M % 128) == 0 && (N % 128) == 0 && Kp >= LARGEK_THRESH) {
-        // Large-K wide-N: try 128x128 to halve B working-set per pass.
-        // Only when wg128 fills the CUs (halving NT doubles WGs).
-        int wg128 = (M / 128) * (N / 128);
-        if (wg128 >= CU)
-            return {128, 128, 2, 2};  // large-K wide-N: halve B working-set per WG
-    }
     // 128x384 path: 12 acc per wave, taken when it saves a whole CU wave over 128x256.
     // Requires WAVES_M=1, WAVES_N=4 so N_PW=3 satisfies the scale static_assert (N_PW<=4).
     // Compute per B-slot = 1152/9 = 128 cyc (vs 64 for 128x256), so PFD=5 covers 640 cyc.
-    // Only activates for moderate K (B-slice = 384*Kp*0.75; at LARGEK_THRESH=32768 this is
-    // 9.4MB, past L2 — so we gate Kp < LARGEK_THRESH and let 128x128 handle the rest).
-    if (wg256 < CU && (M % 128) == 0 && (N % 384) == 0 && Kp < LARGEK_THRESH) {
+    bool wide384 = wg256 < CU && (M % 128) == 0 && (N % 384) == 0;
+    bool saves_a_wave = false;
+    if (wide384) {
         int wg384 = (M / 128) * (N / 384);
         int wg256_grid = (M / 128) * (N / 256);
-        bool saves_a_wave =
+        saves_a_wave =
             wg384 >= CU && 3 * ((wg384 + CU - 1) / CU) < 2 * ((wg256_grid + CU - 1) / CU);
-        if (saves_a_wave)
-            return {128, 384, 4, 3};  // WAVES_M=1, WAVES_N=4, MPW=4, NPW=3
+    }
+    // Wave-saving 128x384 is NOT K-gated: it beats 128x128 by 35-41% at large K (measured
+    // 2026-08-05, M=2048 N=6144, K=32768..105728). The B/N-slice does grow, but A is re-read
+    // N/NT times, so the wider tile moves 1.5x fewer bytes overall — at large K this shape is
+    // bandwidth-bound and total traffic, not B's L2 residency, is what decides.
+    if (saves_a_wave)
+        return {128, 384, 4, 3};  // WAVES_M=1, WAVES_N=4, MPW=4, NPW=3
+    if (wg256 < CU && (M % 128) == 0 && (N % 128) == 0 && Kp >= LARGEK_THRESH) {
+        // Only when wg128 fills the CUs (halving NT doubles WGs) — that is what buys the win:
+        // 3 full CU waves instead of 128x256's 2 half-empty ones.
+        int wg128 = (M / 128) * (N / 128);
+        if (wg128 >= CU)
+            return {128, 128, 2, 2};  // large-K wide-N that 128x384 cannot take
     }
     if (wg256 < CU && (M % 128) == 0 && (N % 256) == 0)
         return {128, 256, 2, 4};  // WG-starved small-M: fill CUs
     // Correctness floor. Every arm above is a PERF choice, gated on CU fill and on Kp; a shape
     // they all decline used to land on 256x256 unconditionally, and the grid is launched with
     // integer division, so a 256 that does not divide M/N silently dropped the remainder (e.g.
-    // M=256 N=384 Kp=32832: 128x128 wants wg128>=CU, 128x384 is K-gated, 128x256 needs N%256==0
-    // -> 256x256 on a 1x1 grid, columns 256..383 never written). Pick the widest IMPLEMENTED
-    // tile that actually divides the shape, preferring the better-measured route on ties.
+    // M=256 N=384 Kp=32832: the wave-saving arm wants wg384>=CU and 128x128 wants wg128>=CU (both
+    // are 2 and 6 here), and 128x256 needs N%256==0 -> 256x256 on a 1x1 grid, columns 256..383
+    // never written). Pick the widest IMPLEMENTED tile that actually divides the shape,
+    // preferring the better-measured route on ties. This also subsumes the old K-gated
+    // "only_exact_route" arm: an N%256!=0 shape below LARGEK_THRESH reaches the 128x384 line here
+    // and gets the same tile, so keeping a separate arm for it would only be a slower way to
+    // spell the same answer.
     if ((M % 256) == 0 && (N % 256) == 0) return {256, 256, 4, 4};  // workhorse: 16-acc sweet spot
     if ((M % 128) == 0 && (N % 256) == 0) return {128, 256, 2, 4};
     if ((M % 128) == 0 && (N % 384) == 0) return {128, 384, 4, 3};  // only route when N%256!=0

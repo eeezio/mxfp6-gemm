@@ -8,9 +8,9 @@
 // ONE kernel paradigm (hybrid drip-A: A staged deep-K in LDS double-buffered + B streamed
 // coalesced HBM->VGPR ring + dripped A loads + RDB barrier + tiled-scale), routed by shape:
 //   * 256x256 (16-acc sweet spot) — workhorse for CU-filling shapes.
-//   * 128x384 (12-acc, WAVES_M=1/WAVES_N=4) — moderate-K wide-N, perfect CU fill when N%384==0.
+//   * 128x384 (12-acc, WAVES_M=1/WAVES_N=4) — wide-N, perfect CU fill when N%384==0.
 //   * 128x256 (8-acc)             — WG-starved small-M, to fill idle CUs.
-//   * 128x128 (4-acc)             — large-K wide-N, shrinks B working set to fit L2.
+//   * 128x128 (4-acc)             — large-K wide-N that 128x384 cannot take; wins on wave count.
 // Same lds_gemm_hybrid_dripA kernel for all (tile-general); only the tile args differ.
 #include "kernel.hpp"
 #include "mxfp6/gemm.hpp"  // TileChoice, choose_tile (declarations)
@@ -100,16 +100,16 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
         return;
     }
     if (tc.MT == 128 && tc.NT == 128) {
-        // 128x128 tile: large-K wide-N path — halve B working-set per WG to improve L2 residency.
-        // NB=6 (vs 12 for 128x256); shorter MFMA window but 2x more WGs cover the output.
-        // Tradeoff: less latency-hiding headroom but better cache reuse. Measurement decides.
+        // 128x128 tile: large-K wide-N path. Beats 128x256 by dropping the half-empty second CU
+        // wave (measured 1274 -> 1767 on 2048x6144x105728), not by fitting B in L2 — its 128-col
+        // B/N-slice is 10.16 MB against a 4 MB L2. NB=6 (vs 12 for 128x256).
         dim3 g(M / 128, N / 128);
         int lds = 2 * (128 * (KT * 6 / 8));
         lds_gemm_hybrid_dripA<128, 128, KT, 2, 2, 1, 0, OutT, false>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     } else if (tc.MT == 128 && tc.NT == 384) {
-        // 128x384 tile: moderate-K wide-N path — perfect CU fill (256 WGs), 12 acc/wave.
+        // 128x384 tile: wide-N path — perfect CU fill (256 WGs), 12 acc/wave.
         // WAVES_M=1, WAVES_N=4 → N_PW=3 ≤ 4 (satisfies scale static_assert).
         // NB=9 but compute/B-slot = 1152/9 = 128 cyc (vs 64 for 128x256) → deeper look-ahead.
         dim3 g(M / 128, N / 384);

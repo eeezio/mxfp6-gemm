@@ -112,23 +112,25 @@ load fetch all of a wave's scales for an entire K_TILE — minimizing the number
 **What**: `choose_tile(M,N,Kp)` selects between four tiles. It runs two stages: a *perf* stage of
 three arms, each gated on `(M/256)*(N/256) < CU && M%128==0`, then a *correctness floor*.
 
-- **128×128** (4 acc) — large-K wide-N shapes where B's per-N-slice working set overflows L2
-  (`Kp≥32768 && (M/128)*(N/128) ≥ CU`). Halving the N-tile halves the B working set streamed per
-  workgroup, restoring L2 residency (see §9).
-- **128×384** (12 acc, `WAVES_M=1`/`WAVES_N=4`) — moderate-K wide-N shapes (`N%384==0 &&
-  Kp<LARGEK_THRESH`) where 128×256 wastes a CU wave. Taken when it saves a whole wave.
+- **128×384** (12 acc, `WAVES_M=1`/`WAVES_N=4`) — wide-N shapes where 128×256 wastes a CU wave.
+  Taken whenever it saves a whole wave, at **any** K.
+- **128×128** (4 acc) — the large-K wide-N shapes 128×384 cannot take (`Kp≥32768 &&
+  (M/128)*(N/128) ≥ CU`). Its win over 128×256 is wave quantization, not L2 residency (see §9).
 - **128×256** (8 acc) — small-M, WG-starved shapes, where a smaller tile spawns more workgroups to
   fill the CUs (`N%256==0`). This is the fall-through of the two above.
 - **Correctness floor** — a shape all three arms decline picks the widest tile that *divides* it:
   256×256 → 128×256 → 128×384 (`N%256!=0`) → 128×128. 256×256 stays the default for the
-  CU-filling `M%256==0 && N%256==0` case, so nothing that already routed well moves.
+  CU-filling `M%256==0 && N%256==0` case, so nothing that already routed well moves. The floor
+  also subsumes the old `only_exact_route` arm: an `N%256!=0` shape that no perf arm takes lands
+  on the 128×384 line here, so a separate K-gated arm for it would be dead code.
 
 **Why**: At occ1, a large tile on small shapes leaves the grid with fewer workgroups than CUs,
 idling half the machine. The small-M path raises the workgroup count with a smaller tile to fill
 the CUs, while **reusing the entire hybrid machinery** (drip-A, B-direct, swapped-C) — only the
 tile template parameters change; no new kernel is introduced. The 128×128 and 128×384 paths are that
-same machinery again, chosen when something other than raw workgroup count binds: the *cache* for
-128×128 (§9), and *wave quantization* for 128×384.
+same machinery again, chosen when something other than raw workgroup count binds: *wave
+quantization* for both, and for 128×384 also the DRAM traffic it saves by re-reading A fewer times
+(§9).
 
 **The 128×384 cost model.** Filling the CUs is not a sufficient test for a wider tile, because a
 128×384 workgroup does 1.5× the work of a 128×256 one — it only pays when it saves a whole CU wave.
@@ -144,17 +146,18 @@ the 1.33× the model alone predicts — the rest is the 8→12 accumulators-per-
 the bigger workgroup is pure loss. Ties reject, since the extra accumulators may well win in the tie
 band but that is unmeasured.
 
-**Why the correctness floor is separate from the cost model.** All three perf arms are gated on
-`wg256 < CU`, and two of them on `Kp` as well, so any shape they decline used to land on 256×256
-unconditionally — and the grid is launched with integer division, so a 256 that does not divide M or
-N silently drops the remainder. Three families hit this: `N%384==0 && N%256!=0` at `Kp≥32768`
-(`M=256, N=384, K=32768` → `dim3(1,1)`, columns 256..383 never written), the same N on a CU-filling
-grid (`M=8192, N=6528` at any K, since `wg256=800`), and M an odd multiple of 128 on a CU-filling
-grid (`M=896`, last 128 rows dropped). Making divisibility a floor *below* the cost model — rather
-than another clause *inside* it — fixes all three at once and cannot regress a tuned shape, because
-the floor's first line returns exactly the 256×256 the old fall-through did whenever that tile is
-valid. ⚠️ It only reaches as far as the implemented tiles do: an M or N that is not a multiple of
-128 still truncates, and proper remainder handling is not implemented.
+**Why the correctness floor is separate from the cost model.** Every perf arm is gated on
+`wg256 < CU` and on a workgroup count of its own (`wg384 ≥ CU`, `wg128 ≥ CU`), so any shape they all
+decline used to land on 256×256 unconditionally — and the grid is launched with integer division, so
+a 256 that does not divide M or N silently drops the remainder. Three families hit this:
+`N%384==0 && N%256!=0` on a small grid (`M=256, N=384`: `wg384=2`, `wg128=6`, so `dim3(1,1)` and
+columns 256..383 are never written), the same N on a CU-filling grid (`M=8192, N=6528` at any K,
+since `wg256=800` makes `wide384` false), and M an odd multiple of 128 on a CU-filling grid
+(`M=896`, last 128 rows dropped). Making divisibility a floor *below* the cost model — rather than
+another clause *inside* it — fixes all three at once and cannot regress a tuned shape, because the
+floor's first line returns exactly the 256×256 the old fall-through did whenever that tile is valid.
+⚠️ It only reaches as far as the implemented tiles do: an M or N that is not a multiple of 128 still
+truncates, and proper remainder handling is not implemented.
 
 `choose_tile` is host code with no HIP dependency, so its decisions are gated by
 `test_gemm --routing` (ctest target `routing`) on machines without a GPU.
@@ -231,27 +234,66 @@ margin `Kp·(S−W)/(S²·base_wg) ≈ 8–10`, conservatively 10). Validated: i
 
 ---
 
-## 9. Large-K wide-N: the L2-capacity wall (working-set reduction, not latency-hiding)
+## 9. Large-K wide-N: the L2 sag, and what actually decides the tile
 
 **Symptom**: on wide-N shapes that already fill the CUs along M/N (so split-K does not apply),
 throughput *peaks* at moderate K and then *drops* at very large K. Measured on **MI350X** (the
-primary gfx950 target), `2048×6144×K` (FP16): `K=16128 → 1588`, `K=105728 → 1260` TFLOPS — a 21%
-fall, and CK's mxfp8 (`1413`) overtakes us there. (Same pattern on MI355X: `1799 → 1323`.)
+primary gfx950 target), `2048×6144×K` (FP16, 128×256 tile): `K=16128 → 1588`, `K=105728 → 1260`
+TFLOPS — a 21% fall, and CK's mxfp8 (`1413`) overtakes us there. (Same pattern on MI355X:
+`1799 → 1323`.)
 
-**Root cause** (ATT-confirmed on the MI355X reference node, see the wiki case study): B is streamed
-HBM→VGPR (§3.2) and each 128×256 workgroup streams its `256 × K × 0.75`-byte B/N-slice. That slice
-is shared across the M-row workgroups of an N-slice, so it *wants* to live in L2:
-- `K=16128` → 3.1 MB/N-slice → fits L2 → `buffer_load` avg stall ≈ 257 cyc.
-- `K=105728` → 20.3 MB/N-slice → overflows L2 → every tile re-fetches from HBM → stall ≈ **2538
+**Root cause of the sag** (ATT-confirmed on the MI355X reference node, see the wiki case study): B is
+streamed HBM→VGPR (§3.2) and each 128×256 workgroup streams its `256 × K × 0.75`-byte B/N-slice. That
+slice is shared across the M-row workgroups of an N-slice, so it *wants* to live in L2:
+- `K=16128` → 3.1 MB/N-slice → fits the 4 MB per-XCD L2 → `buffer_load` avg stall ≈ 257 cyc.
+- `K=105728` → 20.3 MB/N-slice → overflows it → every tile re-fetches from HBM → stall ≈ **2538
   cyc** (≈10×). The `PFD=5` ring covers only ~250 cyc, so the latency is exposed.
 
-**The fix — halve the working set (§6, 128×128 tile)**: routing large-K wide-N to a 128×128 tile
-halves the B/N-slice per workgroup (20.3 → 10.2 MB), which restores L2 residency. Measured **MI350X**
-`2048×6144×105728`: **1260 → 1509 TFLOPS (+19.8%)**, now **1.07× CK** — the large-K penalty is
-essentially gone. Cross-checked on the **MI355X** reference node (higher-clocked): **1318 → 1811
-(+37%), 1.19× CK**. The cost (a shorter MFMA window, NB=6 vs 12, and 2× the workgroups) is far
-outweighed by the cache win. Guarded so it triggers *only* when the cache, not the CU count, is the
-binding constraint; all other shapes are byte-for-byte unchanged.
+That is a real and sufficient account of **why throughput sags as K grows**. It is *not* an account of
+**which tile wins** — an earlier version of this section conflated the two and concluded that the fix
+was to shrink B's slice until it fit L2. Measurement refuted that; the corrected reasoning follows.
+
+**What actually decides the tile.** Every workgroup reads its own A slice and its own B slice once,
+so the totals over the whole GEMM are
+
+```
+A bytes = M · (N/NT) · Kp · 0.75      ∝ 1/NT     (A is re-read once per N-tile column)
+B bytes = (M/MT) · N · Kp · 0.75      ∝ 1/MT
+```
+
+At `M=2048, N=6144, Kp=105792` (MI350X `bg-1w300-k2-3a`, clocks locked at 2200 MHz, n=5, tiles forced
+through a test-only bypass of `choose_tile`, XCD swizzle off — so these are tile effects only):
+
+| tile | A | B | total | WGs | CU waves | wave-quantized cost | measured |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 128×256 | 3.9 GB | 7.8 GB | 11.7 GB | 384 | 2 (second half-empty) | 2 × 32768 = 65536 | 1274 |
+| 128×128 | 7.8 GB | 7.8 GB | 15.6 GB | 768 | 3 | 3 × 16384 = 49152 | 1767 |
+| 128×384 | **2.6 GB** | 7.8 GB | **10.4 GB** | 256 | **1** | 1 × 49152 = 49152 | **2454** |
+
+- **128×128 beats 128×256 while moving *more* bytes.** What it removes is the half-empty second CU
+  wave (65536 → 49152). That is the mechanism of the original large-K fix — not L2 residency. A
+  128-column B/N-slice is 10.16 MB against a 4 MB L2 and does not fit either.
+- **128×384 beats 128×128 by 35–41%** at *identical* wave-quantized cost, purely by moving 1.5× fewer
+  bytes (A is re-read 16 times instead of 48). Its B/N-slice is 30.5 MB — three times *larger* than
+  the slice the L2-residency story said had to shrink. This is a direct disproof of B-slice capacity
+  as the operative criterion for tile choice.
+
+So the rule is **wave-quantized cost first, then total traffic** (§6). Un-K-gating the wave-saving
+arm moves exactly **three `(M,N)` families** — those whose 128×384 grid is exactly 256 workgroups —
+found by enumerating `choose_tile` old-vs-new over `M ≤ 4096`, `N ≤ 20480` (multiples of 128) and
+`Kp` up to 105792. All three were measured, with CK MXFP8 in the same session:
+
+| shape | CK MXFP8 | 128×128 | 128×384 | delta | vs CK |
+|---|---:|---:|---:|---:|---:|
+| `2048×6144×105728`  | 1463 | 1767 | **2557** | +44.7% | 1.21× → **1.75×** |
+| `1024×12288×105728` | 1463 | 1649 | **2540** | +54.1% | 1.13× → **1.74×** |
+| `4096×3072×105728`  | 1442 | 1760 | **2504** | +42.3% | 1.22× → **1.74×** |
+
+At `K=32768` (the old gate boundary) the same three give +44.4% / +45.5% / +38.7%. The 128×128 tile
+is what remains for the large-K
+wide-N shapes where `N%384 != 0` puts 128×384 out of reach — where it is still worth **1260 → 1509
+TFLOPS (+19.8%), 1.07× CK** over 128×256 on MI350X (cross-checked on the higher-clocked MI355X
+reference node: **1318 → 1811, +37%, 1.19× CK**).
 
 **Why not latency-hiding?** Two latency-oriented attempts were built and measured, and both *lost* —
 which is the load-bearing lesson here:
@@ -265,6 +307,11 @@ which is the load-bearing lesson here:
   `wait_vmcnt(0)` that guards the A double-buffer barrier necessarily drains the cross-tile B loads
   too (an earlier build measured −25%). No inline-asm trick escapes a shared counter.
 
-**Takeaway**: latency-hiding is the right tool when latency is the bottleneck; **working-set
-reduction is the right tool when bandwidth/cache-capacity is**. At large K on a wide tile the
-kernel is capacity-bound, so shrinking B/N-slice beats every attempt to hide its latency.
+**Takeaway**: three mechanisms live in this regime and they answer different questions. L2 capacity
+explains **the sag against K**. Wave quantization and total DRAM traffic decide **which tile wins**.
+Latency-hiding answers neither, because at large K the kernel is bandwidth-bound and neither LDS
+staging nor a deeper ring reduces the bytes moved. The trap this section fell into was reading the
+first as an answer to the second: B's slice does overflow L2, so shrinking it *looked* like the fix,
+and the tile that shrank it *was* faster — for an unrelated reason. The wider tile, which overflows
+L2 three times harder, is faster still.
+

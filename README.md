@@ -57,13 +57,14 @@ Wide-N shapes fill the CUs, so split-K does not apply, but the 128×256 tile is 
 different ways depending on K, and each gets its own route (see
 [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) §6, §9):
 
-* **Moderate K → 128×384.** `2048×6144` on 128×256 is 384 workgroups for 256 CUs — 1.5 CU waves, so
-  the second wave runs half empty. A 384-wide tile makes it exactly 256 workgroups (one full wave)
-  and raises accumulators per wave from 8 to 12. Taken only when the wider tile saves a whole CU
-  wave, since its workgroup does 1.5× the work.
-* **Very large K → 128×128.** Here the binding constraint is the cache, not the CU count: the B
-  working set per N-slice overflows L2 and the direct-B ring is left exposed to HBM latency. Halving
-  the N-tile halves the B working set per workgroup and restores L2 residency.
+* **Wide N → 128×384.** `2048×6144` on 128×256 is 384 workgroups for 256 CUs — 1.5 CU waves, so the
+  second wave runs half empty. A 384-wide tile makes it exactly 256 workgroups (one full wave) and
+  raises accumulators per wave from 8 to 12. Taken only when the wider tile saves a whole CU wave,
+  since its workgroup does 1.5× the work — but then at **any** K: at `K=105728` it is 44.7% faster
+  than the 128×128 route, because a wider N-tile also re-reads A fewer times (2.6 GB vs 7.8 GB).
+* **Very large K, `N%384 != 0` → 128×128.** What binds is still wave count, not the cache: 128×128
+  runs 3 full waves against 128×256's 2 half-empty ones. Its B slice does overflow L2, but shrinking
+  that slice is not why it wins — see §9.
 
 Measured on **MI350X** `bg-1w300-k2-3a`, ours + CK in one session, interleaved, FP16, `2048 × 6144`
 (median of 3 reps; raw:
@@ -75,6 +76,23 @@ Measured on **MI350X** `bg-1w300-k2-3a`, ours + CK in one session, interleaved, 
 | 2048 × 6144 × 4096   | 1290 | 1427 | **2131** | 128×384 | **1.65×** (was 1.11×) |
 | 2048 × 6144 × 16128  | 1654 | 1702 | **2707** | 128×384 | **1.64×** (was 1.03×) |
 | 2048 × 6144 × 105728 | 1463 | 1762 | 1759     | 128×128 | **1.20×** (control: already routed to 128×128, unchanged) |
+
+> ⚠️ The last row is a faithful record of the 2026-07-29 run, but its **route has since changed** —
+> the wave-saving 128×384 arm is no longer K-gated. Re-measured below.
+
+Removing that K-gate moves exactly three `(M,N)` families: the ones where a 128×384 grid lands on
+exactly 256 workgroups. Re-measured on the same MI350X with CK MXFP8 in the same session
+(2026-08-11, deterministic clocks at 2200 MHz, interleaved, median of 3):
+
+| M × N × K | CK MXFP8 | before (128×128) | after (128×384) | delta | after vs CK |
+|---|---:|---:|---:|---:|---:|
+| 2048 × 6144 × 105728  | 1463 | 1767 | **2557** | **+44.7%** | **1.75×** (was 1.21×) |
+| 1024 × 12288 × 105728 | 1463 | 1649 | **2540** | **+54.1%** | **1.74×** (was 1.13×) |
+| 4096 × 3072 × 105728  | 1442 | 1760 | **2504** | **+42.3%** | **1.74×** (was 1.22×) |
+
+The same three families at `K=32768`, the old gate boundary: +44.4% / +45.5% / +38.7%. CK in this
+session reproduces its 2026-07-29 numbers to within 1% (K=16128: 1669 vs 1654; K=105728: 1463 vs
+1463), which is the check that the two sessions are comparable.
 
 Both routes are auto-selected in `choose_tile`; shapes that meet neither condition are
 byte-for-byte unchanged. The 128×128 route was separately cross-checked on **MI355X**
@@ -313,7 +331,7 @@ template <int M_TILE, int N_TILE, int K_TILE, int WAVES_M, int WAVES_N, int MIN_
 
 | Param | Default | Meaning |
 |---|---|---|
-| `M_TILE` × `N_TILE` | 256×256 / 128×384 / 128×256 / 128×128 | Register accumulator tile per workgroup. Larger ⇒ higher arithmetic intensity (AI) but fewer workgroups. The live shape knob (`choose_tile`): 256×256 for CU-filling shapes, 128×256 for WG-starved small-M, 128×384 for moderate-K wide-N (removes wave quantization, 12 acc/wave), 128×128 for large-K wide-N (shrinks B working set to fit L2). |
+| `M_TILE` × `N_TILE` | 256×256 / 128×384 / 128×256 / 128×128 | Register accumulator tile per workgroup. Larger ⇒ higher arithmetic intensity (AI) but fewer workgroups. The live shape knob (`choose_tile`): 256×256 for CU-filling shapes, 128×256 for WG-starved small-M, 128×384 for wide-N (removes wave quantization, 12 acc/wave, and re-reads A fewer times), 128×128 for the large-K wide-N shapes 128×384 cannot take. |
 | `K_TILE` | 192 | Deep-K tile depth = size of the MFMA window backing one load. Bigger window hides load latency. `subs = K_TILE/64`. |
 | `WAVES_M` × `WAVES_N` | 2×2 (1×4 for 128×384) | How the tile is split across the block's 4 waves → per-wave block shape `MPW×NPW` = `(M_TILE/32/WAVES_M)×(N_TILE/32/WAVES_N)`. Sets the load-vs-MFMA ratio (perimeter vs area) and input VGPR. 128×384 must use 1×4: 2×2 would give `N_PW=6` and trip the `NPW≤4` scale assert. |
 | `MIN_OCC` | 1 | Occupancy floor (`__launch_bounds__` 2nd arg). occ1 holds the largest tile; occ2 forces a smaller AI (see coupling). |
