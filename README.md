@@ -132,7 +132,7 @@ end pad via `a_compact_end_pad`. See [K-padding](#k-padding--why-a-stays-compact
 using namespace mxfp6;
 
 // Inputs (host): A is row-major [M][K] (activations), B is row-major [K][N] (weights).
-// M and N must be multiples of 256; K a multiple of 32 (see Requirements).
+// M and N must be multiples of 128; K a multiple of 32 (see Requirements).
 int M = 8192, N = 8192, K = 8192;
 
 int Kp = kpad(K);                        // pad K up to a multiple of K_TILE (=192); here 8256
@@ -251,13 +251,13 @@ gives a safe scale tail automatically). Same result, but A is padded per-row.
 - **K must be a multiple of 32** (the MX block size). It is then padded internally to `kpad(K)`
   (a multiple of `K_TILE`=192) — pass `kpad(K)` as the kernel's `Kp`. ⚠️ A K that is not a
   multiple of 32 is silently mis-quantized in a release build (the `assert` is compiled out).
-- **M and N must be multiples of 256** (the tile) — that is always safe. The 128-wide routes relax
-  this: they need `M%128==0`, and N a multiple of 256 (128×256, 128×128) or 384 (128×384). Pad M/N
-  up otherwise. ⚠️ The grid is launched with integer division and there is **no remainder
-  handling**, so an M/N that no selected tile divides silently drops the remainder rows/cols. This
-  bites hardest on N values that are a multiple of neither 256 nor 384 *and* large enough to fill
-  the CUs (e.g. `N=102272`, where `choose_tile` falls through to 256×256 and the last 128 columns
-  are never written). Check `choose_tile(M,N,Kp).MT/.NT` divide your M/N.
+- **M and N must be multiples of 128.** Multiples of 256 hit the workhorse 256×256 tile; the
+  128-wide routes cover the rest (N a multiple of 384 → 128×384, of 256 → 128×256, otherwise
+  128×128). `choose_tile()` treats divisibility as a hard floor: if the perf arms — which are gated
+  on CU fill and on `Kp` — all decline, it still returns the widest tile that *divides* the shape
+  rather than the fastest one. ⚠️ Below that, the grid is launched with integer division and there
+  is **no remainder handling**, so an M or N that is not a multiple of 128 silently drops the
+  remainder rows/cols. Pad up to 128, or check `choose_tile(M,N,Kp).MT/.NT` divide your M/N.
 - **B is transposed by `preprocess_B`.** Pass B in its natural `[K][N]` row-major layout; the
   helper produces `Bᵀ[N][K]` and quantizes it.
 - **Scale grouping must match the tile.** Use `choose_tile(M,N,Kp).MPW` for A's `tile_scale` and
