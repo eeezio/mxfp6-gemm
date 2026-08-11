@@ -17,6 +17,12 @@
 namespace mxfp6 {
 namespace detail {
 
+// Grid swizzle mode for lds_gemm_hybrid_dripA's SWZ parameter: XCD-aware workgroup remap.
+// Measured +4.6%/+3.8% on the 256x256 large-N shallow-K shapes and +3.2% on 128x384; the 128x128
+// route LOSES 3.5% (its wg_m A-slices are 10 MB at large K, so grouping by wg_n costs more A
+// locality than it buys in B) and the 128x256 route is unmeasured -- both stay unswizzled.
+constexpr int SWZ_XCD = -1;
+
 // Split factor S for (M,N,Kp): the number of K-segments to split across independent workgroups
 // for a WG-starved shape (S==1 means "do not split"). SINGLE SOURCE OF TRUTH — both the public
 // gemm_workspace_size() query and dispatch_gemm() call this so the workspace a caller sizes always
@@ -118,7 +124,7 @@ inline void dispatch_gemm_kge(int M, int N, int Kp, const void* dA, const void* 
         // NB=9 but compute/B-slot = 1152/9 = 128 cyc (vs 64 for 128x256) → deeper look-ahead.
         dim3 g(M / 128, N / 384);
         int lds = 2 * (128 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<128, 384, KT, 1, 4, 1, 0, OutT, false, KGE2>
+        lds_gemm_hybrid_dripA<128, 384, KT, 1, 4, 1, SWZ_XCD, OutT, false, KGE2>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     } else if (tc.MT == 128) {
@@ -145,7 +151,7 @@ inline void dispatch_gemm_kge(int M, int N, int Kp, const void* dA, const void* 
     } else {
         dim3 g(M / 256, N / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, 0, OutT, false, KGE2>
+        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     }
@@ -185,7 +191,7 @@ inline void dispatch_gemm_force_tile_kge(int M, int N, int Kp, TileChoice tc, co
     } else if (tc.MT == 128 && tc.NT == 384) {
         dim3 g(M / 128, N / 384);
         int lds = 2 * (128 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<128, 384, KT, 1, 4, 1, 0, OutT, false, KGE2>
+        lds_gemm_hybrid_dripA<128, 384, KT, 1, 4, 1, SWZ_XCD, OutT, false, KGE2>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     } else if (tc.MT == 128) {
@@ -197,7 +203,7 @@ inline void dispatch_gemm_force_tile_kge(int M, int N, int Kp, TileChoice tc, co
     } else {
         dim3 g(M / 256, N / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, 0, OutT, false, KGE2>
+        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     }

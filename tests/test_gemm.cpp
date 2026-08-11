@@ -402,6 +402,12 @@ int main(int argc, char** argv) {
     // 256x384x768: grid 2x1 WGs, k_tiles=4. 384x768x960: grid 3x2 WGs, k_tiles=5.
     f += !verify_128x384(256, 384, 768);
     f += !verify_128x384(384, 768, 960);
+    // Same path, but a grid of 10x3 = 30 workgroups. The 128x384 route is XCD-swizzled, and the
+    // remap only has to distribute a remainder when the grid exceeds NXCC=8: below that,
+    // per=0/rem=total collapses it to the identity, which is what the two shapes above hit. At 30
+    // it is per=3, rem=6, so both arms of the bijection run. A remainder bug there does not fault
+    // -- it leaves an output tile claimed by no workgroup, which only a value check catches.
+    f += !verify_128x384(1280, 1152, 384);
     // Routed (not forced) 128x384 on a WG-starved grid deep enough to tempt split-K: wg384=1,
     // k_tiles=16. Before the splitk_S guard this ran a 128x256 kernel against NPW=3 scales and
     // wrote only 256 of the 384 columns. Run twice: once as a normal caller, once handing over a

@@ -102,8 +102,10 @@ load fetch all of a wave's scales for an entire K_TILE — minimizing the number
 
 - **N-major MFMA loop** (`for ni: for mi`): a zero-register-cost loop-order choice that improves
   the AGPR access pattern.
-- **Per-machine swizzle width**: swizzle affects the geometric distribution of L2 hits; the
-  dispatcher selects the swizzle width that is best on this machine for each shape.
+- **Workgroup swizzle**: the kernel's `SWZ` parameter remaps `(blockIdx.x, blockIdx.y)` to
+  `(wg_m, wg_n)`. Positive `SWZ` groups `G` N-blocks so `wg_n` varies fastest, which optimizes A
+  reuse — that was swept for drip-A and **lost** (`swz32` did not beat `swz0`), so it is unused.
+  Negative `SWZ` selects the XCD-aware remap of §11, which is what ships on two of the four routes.
 
 ---
 
@@ -345,3 +347,86 @@ zero spill).
 > *compile* time is the only mechanism that works, and paying for it with a template arm is the
 > reason this is a dispatch-level change rather than a one-line kernel edit.
 
+---
+
+## 11. XCD-aware grid swizzle: making B's reuse across XCDs actually happen
+
+**What**: on the 256×256 and 128×384 routes the kernel remaps the linear workgroup id so that each
+XCD receives a **contiguous run** of tile ids (`SWZ_XCD`, the `SWZ < 0` branch in `kernel.hpp`):
+
+```
+x   = pid % NXCC            // XCD id -- fixed by hardware, cannot be changed
+s   = pid / NXCC            // this XCD's s-th job
+L   = x < rem ? x*(per+1) + s : rem + x*per + s     // per = total/NXCC, rem = total%NXCC
+wg_m = L % gridDim.x        // gridDim.x consecutive L share one wg_n
+wg_n = L / gridDim.x
+```
+
+**Why**: MI350X is 8 XCDs of 32 CUs, each XCD with its own 4 MB L2 behind a shared 256 MB LLC. The
+dispatcher hands workgroup `pid` to XCD `pid % 8` — verified on hardware with a probe kernel reading
+`hwreg(HW_REG_XCC_ID)`, which found `xcc == pid % 8` for 3304/3304 workgroups of the real grid.
+Consecutive pids therefore land on *different* XCDs, and the 32 workgroups resident on one XCD end up
+holding 32 **distinct** `wg_n` — so the B slice that M-blocks are supposed to share is fetched once
+per workgroup instead of once per XCD. For `2048×105728×1024` that is a 221 KB B/N-slice × 32 =
+7.1 MB of B live per XCD against a 4 MB L2; B's 8× reuse is never realized. The remap drops the
+resident `wg_n` count to 4.88, i.e. 1.08 MB — back inside L2.
+
+Measured on MI350X (interleaved A/B, deterministic clocks, n=10): **+4.56%** on `2048×105728×1024`,
+**+3.77%** on `2048×102272×1024`, **+3.24%** on `2048×6144×16128`.
+
+> **Do not predict an 8× effect.** All of B is 91 MB and the LLC is 256 MB, so most of the traffic
+> the remap eliminates was LLC→L2, not HBM. What is saved is LLC round-trip latency and bandwidth.
+
+**The gain really is XCD locality, not reordering.** A sham control was built: the *same* bijection
+and the *same* runtime division cost, with only the final decomposition swapped
+(`wg_m = L/nb, wg_n = L%nb`) so that the distinct-`wg_n`-per-XCD count returns to its baseline 32.
+It measured −0.55% / −0.77% / −0.23% — all slightly negative, i.e. the division cost with none of
+the benefit. Reordering per se buys nothing.
+
+**It is a trade, so it is gated per route.** The remap groups `wg_n` by *scattering* `wg_m`:
+
+| route | distinct `wg_m` / XCD | distinct `wg_n` / XCD | one slice |
+|---|---|---|---|
+| 256×256, `K=1024` | 1 → 8 | 32 → 4.88 | 221 KB |
+| 128×128, `K=105728` | 2 → 16 | 16 → 2 | 10.16 MB |
+
+At `K=1024` all of A is 1.77 MB, so scattering `wg_m` costs essentially nothing and the B win is
+free. At `K=105728` both slices are 10.16 MB and the exchange is **numerically symmetric** — 18
+slices before, 18 after — yet the route measures **−3.48%** (8/8 reps). Working-set size therefore
+does not explain it; the asymmetry is in the two data paths. A is a cooperative `buffer_load_lds`
+DMA with a `wait_vmcnt(0)` before every double-buffer barrier, so its latency sits on the tile-level
+critical path, whereas B rides a `PFD=5` register ring built to absorb latency — scattering A hurts
+more than gathering B helps. *(That attribution is a hypothesis; it has not been isolated by
+experiment.)* The practical consequence is that **128×128 and 128×256 ship unswizzled**, and
+split-K is excluded outright by `static_assert(!SPLITK)` because it uses a 3D grid where the
+`pid % 8` premise does not hold.
+
+**Bijectivity is a correctness requirement, not a nicety.** If the remap is not a bijection some
+tile is claimed by no workgroup, and the output silently loses a block with no error anywhere. The
+`rem` term exists precisely so the map stays bijective when `NXCC` does not divide the grid; it was
+verified exhaustively over all 1600 grids in `1..40 × 1..40`, non-divisible cases included.
+
+**Combined with §10** (both are shallow-K/large-N levers and they compose without interference), the
+two changes measure **+8.12%** on `2048×105728×1024` and **+6.79%** on `2048×102272×1024`
+(MI350X, deterministic clocks at 2200 MHz, interleaved A/B against the tip of the split-K guard
+branch, median of 3). The unswizzled routes stay flat: `2048×4096×105728` (128×128) +0.43% and
+`2048×1024×12288` (split-K) −0.12%.
+
+**Known cost: a ~1% regression on a few 256×256 shapes.** Over the whole 50-shape benchmark table
+the swizzle+§10 pair gives 16 shapes better than +2% (best +9.1%) and two shapes worse than −1%:
+`2048×20480×6144` (−1.13%) and, from a follow-up sweep, `2048×12672×6144` (−1.03%). Both are
+reproducible, not noise — every rep of the new build sits below every rep of the old one. There is
+**no clean gate for them**, which is worth stating plainly rather than tuning around:
+
+| shape | delta | | shape | delta |
+|---|---:|---|---|---:|
+| `2048×20480×1024` | +7.25% | | `2048×20480×12288` | −0.32% |
+| `2048×20480×2048` | +4.04% | | `2048×20480×24576` | +2.16% |
+| `2048×20480×4096` | +1.21% | | `2048×16128×6144` | **+2.02%** |
+| `2048×20480×6144` | **−0.98%** | | `2048×12672×6144` | **−1.03%** |
+
+`K=6144` loses at `N=20480` and `N=12672` but *wins* at `N=16128`, so the sign is not a function of
+K alone, nor of N alone. That is consistent with the mechanism — the remap trades A locality for B
+locality, and which side pays depends on the two slice sizes for that specific shape — but it means
+any threshold would be fitted to ~1% effects on three data points. The pair ships ungated on the two
+routes measured positive on aggregate, and these shapes are documented as the price.

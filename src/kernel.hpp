@@ -92,7 +92,23 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     int tid = threadIdx.x, wave = tid / 64, lane = tid % 64;
     int wm = wave / WAVES_N, wn = wave % WAVES_N;
     int wg_m, wg_n;
-    if constexpr (SWZ > 0) {
+    if constexpr (SWZ < 0) {
+        // XCD-aware remap (SWZ_XCD). The hardware hands workgroup pid to XCD pid%NXCC, so
+        // consecutive pids land on DIFFERENT XCDs and the 32 workgroups resident on one XCD end up
+        // holding 32 distinct wg_n -> B's 8x reuse across XCDs is never realised. Handing each XCD
+        // a contiguous run of linear tile ids instead drops that to ~5 distinct wg_n, so its
+        // resident workgroups share B slices. Bijective for any grid: the first `rem` XCDs take
+        // one extra tile. A non-bijective formula would silently drop output tiles.
+        static_assert(!SPLITK, "XCD remap assumes a 2D grid");
+        constexpr int NXCC = 8;
+        int mb = gridDim.x, total = mb * (int)gridDim.y;
+        int pid = blockIdx.y * mb + blockIdx.x;
+        int per = total / NXCC, rem = total % NXCC;
+        int x = pid % NXCC, s = pid / NXCC;
+        int L = x < rem ? x * (per + 1) + s : rem + x * per + s;
+        wg_m = L % mb;
+        wg_n = L / mb;
+    } else if constexpr (SWZ > 0) {
         int mb = gridDim.x, nb = gridDim.y, pid = blockIdx.y * mb + blockIdx.x;
         const int G = SWZ, span = G * mb;
         int grp = pid / span, fn = grp * G, gs = (nb - fn) < G ? (nb - fn) : G, r = pid % span;
