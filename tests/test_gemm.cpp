@@ -346,6 +346,16 @@ static bool check_routing() {
     }
     printf("  split-K tile guard: %d/%d %s\n", (int)(sizeof(ns) / sizeof(*ns)) - sbad,
            (int)(sizeof(ns) / sizeof(*ns)), sbad ? "FAIL<<<" : "OK");
+
+    // Shapes smaller than the tile they fall through to: (M/tc.MT)*(N/tc.NT) == 0, which splitk_S
+    // used to divide by. The divisibility floor covers everything that is a multiple of 128, so
+    // reaching zero now takes an M or N that no tile divides -- 192 and 64 below. Their output is
+    // truncated regardless, but a query has no business killing the process. Nothing to assert
+    // beyond "it returns": an unguarded build dies here with SIGFPE and takes the suite with it.
+    static const NoSplit deg[] = {{192, 256, 32832}, {256, 192, 3072}, {64, 64, 3072}};
+    for (const NoSplit& c : deg) (void)gemm_workspace_size(c.M, c.N, kpad(c.K));
+    printf("  workspace query on sub-tile shapes: %d/%d OK (no SIGFPE)\n",
+           (int)(sizeof(deg) / sizeof(*deg)), (int)(sizeof(deg) / sizeof(*deg)));
     return bad == 0 && div_bad == 0 && sbad == 0;
 }
 

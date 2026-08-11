@@ -39,7 +39,11 @@ inline int splitk_S(int M, int N, int Kp) {
     int k_tiles = (Kp / 64) / (KT / 64);    // total deep tiles for full K = Kp/192
     int base_wg = (M / tc.MT) * (N / tc.NT);
     int S = 1;
-    if (base_wg < CU && k_tiles >= 2 * MIN_TILES_PER_SEG) {
+    // base_wg == 0 when the shape is smaller than the tile it fell through to -- M<256 or N<256
+    // against 256x256. Dividing by it below is a host-side SIGFPE in a *query* function, so guard
+    // it here rather than at the call sites. Such a shape is outside the divisibility contract and
+    // its output is truncated either way; this only stops gemm_workspace_size() from crashing.
+    if (base_wg > 0 && base_wg < CU && k_tiles >= 2 * MIN_TILES_PER_SEG) {
         S = (CU + base_wg - 1) / base_wg;             // ceil(CU/base_wg): min segments to fill CUs
         int s_cap = k_tiles / MIN_TILES_PER_SEG;      // each segment not shorter than the floor
         if (S > s_cap) S = s_cap;
