@@ -285,14 +285,32 @@ __global__ void __launch_bounds__(256, MIN_OCC)
 #pragma unroll
             for (int g = 0; g < 4; g++) {
                 int m0 = mb + g * 8 + nh * 4;
+                if constexpr (!SPLITK && __is_same(OutT, __half)) {
+                    // One v_cvt_pk_f16_f32 converts two accumulators at once (RNE, same rounding as the
+                    // scalar v_cvt_f16_f32 it replaces -- pkrtz would be round-toward-zero). The pair lands on
+                    // two different rows (stride N), so it still needs two stores -- but the second
+                    // should be global_store_short_d16_hi, i.e. no extra shift.
+                    typedef __fp16 fp16x2 __attribute__((ext_vector_type(2)));
+                    __fp16* Dh = reinterpret_cast<__fp16*>(D);
 #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    if constexpr (SPLITK) {
-                        size_t Mtot = (size_t)gridDim.x * M_TILE;
-                        size_t seg_off = (size_t)blockIdx.z * Mtot * N;
-                        Dpart[seg_off + (size_t)(m0 + j) * N + n] = a[g * 4 + j];
-                    } else {
-                        D[(size_t)(m0 + j) * N + n] = (OutT)a[g * 4 + j];
+                    for (int j = 0; j < 4; j += 2) {
+                        fp16x2 p;
+                        asm("v_cvt_pk_f16_f32 %0, %1, %2"
+                            : "=v"(p)
+                            : "v"(a[g * 4 + j]), "v"(a[g * 4 + j + 1]));
+                        Dh[(size_t)(m0 + j) * N + n] = p[0];
+                        Dh[(size_t)(m0 + j + 1) * N + n] = p[1];
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        if constexpr (SPLITK) {
+                            size_t Mtot = (size_t)gridDim.x * M_TILE;
+                            size_t seg_off = (size_t)blockIdx.z * Mtot * N;
+                            Dpart[seg_off + (size_t)(m0 + j) * N + n] = a[g * 4 + j];
+                        } else {
+                            D[(size_t)(m0 + j) * N + n] = (OutT)a[g * 4 + j];
+                        }
                     }
                 }
             }
