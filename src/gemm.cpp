@@ -56,6 +56,13 @@ TileChoice choose_tile(int M, int N, int Kp) {
     if ((M % 256) == 0 && (N % 256) == 0) return {256, 256, 4, 4};  // workhorse: 16-acc sweet spot
     if ((M % 128) == 0 && (N % 256) == 0) return {128, 256, 2, 4};
     if ((M % 128) == 0 && (N % 384) == 0) return {128, 384, 4, 3};  // only route when N%256!=0
+    // N%128==0 but no tile of N_TILE>=256 divides it. 128x128 does, but a 4-acc tile amortizes
+    // shallow-K fixed cost over a quarter of the work: 2048x102272x1024 measures 1274 TFLOPs there
+    // against 1455 for 256x256. So run 256x256 over a ceil(N/256) grid instead and mask the last
+    // N-tile's out-of-range columns at the store (dispatch picks the NMASK kernel off N%256!=0).
+    // Needs (N/32)%NPW == 0 for the scale grouping to still cover every real block, which for
+    // NPW=4 is exactly N%128==0. M must divide 256: there is no M-remainder handling.
+    if ((M % 256) == 0 && (N % 128) == 0) return {256, 256, 4, 4};
     if ((M % 128) == 0 && (N % 128) == 0) return {128, 128, 2, 2};
     return {256, 256, 4, 4};  // no implemented tile covers this shape — caller must pad M/N
 }

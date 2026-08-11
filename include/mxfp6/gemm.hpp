@@ -7,8 +7,10 @@
 //   * 128x384 tile (12-acc) for moderate-K wide-N shapes where N%384==0 and the grid exactly fills CUs
 //   * 128x256 tile (8-acc)  for WG-starved small-M shapes (fills idle CUs)
 //   * 128x128 tile (4-acc)  for large-K wide-N shapes (shrinks B working set to fit L2)
-// Those four are PERF choices; under them divisibility is a hard floor, so choose_tile() never
-// returns a tile that fails to divide M/N as long as M and N are multiples of 128.
+// Those four are PERF choices; under them coverage is a hard floor, so choose_tile() never returns
+// a tile that fails to reach the whole shape as long as M and N are multiples of 128. M is always
+// covered by division; N either by division or, when N%128==0 with no 256-wide divisor, by a
+// ceil(N/256) grid whose last N-tile is masked at the store.
 //
 // This header is device-free (plain declarations) — a host translation unit can include it
 // and link libmxfp6gemm without a HIP compiler. Inputs are pre-quantized DEVICE buffers:

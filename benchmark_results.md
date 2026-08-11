@@ -84,12 +84,19 @@ rows is *indicative, not same-session*. Reason: the CK binary available on this 
 would overstate our margin by 2–3×, so the previously tuned CK figure is kept instead. CK also
 refuses `K % 256 != 0` outright (`KPerBlock`), which rules it out on most of the N=768 rows.
 
-‡ = **not re-measured — our kernel cannot run these shapes.** The launch grid is
-`dim3(M/MT, N/NT)` with integer division and no remainder handling, so N must be a multiple of the
-tile's N. For N=1 and N=128 `floor(N/256)=0`, i.e. **zero workgroups launch** and the old row is
-timing an empty dispatch; for N=3490 / 12672 / 102272 only `floor(N/256)·256` columns are computed
-(162 / 128 / 128 columns short). Their numbers are left exactly as the old harness recorded them and
-should not be read as measurements of this library. Supporting them needs N-remainder handling.
+‡ = **not re-measured — the kernel could not run these shapes when the table was taken.** The grid
+was `dim3(M/MT, N/NT)` with integer division and no remainder handling: for N=1 and N=128
+`floor(N/256)=0`, i.e. **zero workgroups launched** and the old row is timing an empty dispatch; for
+N=3490 / 12672 / 102272 only `floor(N/256)·256` columns were computed (162 / 128 / 128 short).
+Their numbers are left exactly as the old harness recorded them and must not be read as
+measurements of this library.
+
+**Three of the five are now supported** (see `docs/OPTIMIZATIONS.md` §6): N=128 and N=102272 route
+to 256×256 over a ceil grid with the last N-tile masked, and N=12672 (a multiple of 384) routes to
+128×384. `2048×102272×1024` re-measures at **1435 TFLOPs / 0.2989 ms** — 12.7% above the 128×128
+tile that divides it, and within 1.6% per column of the old truncating figure while computing the
+128 columns that figure skipped. N=1 and N=3490 remain unsupported, but for a different reason:
+they are not multiples of 32, so the MX preprocessing rejects them before tiling is even reached.
 
 Split-K rows are identified by `S > 1` in the table (`S` = number of K segments); their `ours_ms`
 includes the FP32 partial-sum reduce.
@@ -289,9 +296,11 @@ section previously quoted is retained raw in `prof_results/bench_mi350x_10.7.191
 
 ## Remaining problems / gaps
 
-1. **N-remainder shapes are unsupported** — `N=1`, `128`, `3490`, `12672`, `102272` cannot be run
-   (see ‡ above): the grid is `dim3(M/MT, N/NT)` with no remainder handling. Their table rows are
-   stale old-harness numbers, not measurements of this library.
+1. **N-remainder shapes** — mostly resolved. `N=128`, `12672`, `102272` now run correctly (masked
+   last N-tile / 128×384; see ‡ above), and their table rows are the only stale ones left.
+   `N=1` and `N=3490` are still unsupported, but the blocker is the MX block size — they are not
+   multiples of 32, so the preprocessing rejects them. Sub-128 N-remainder and any M-remainder
+   remain unimplemented.
 2. **Borderline shapes gated OUT by `k_tiles ≥ 16`** — CU-starved shapes that just miss the K
    threshold get no split and lose hard to CK: `2048×1024×1024` (k_tiles=6, 0.56×),
    `2048×768×1840` (10, 0.53×), `2048×256×2048` (11, 0.48×), `2048×512×2560` (14, 0.46×).

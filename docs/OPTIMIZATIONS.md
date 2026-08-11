@@ -120,11 +120,12 @@ three arms, each gated on `(M/256)*(N/256) < CU && M%128==0`, then a *correctnes
   (M/128)*(N/128) ≥ CU`). Its win over 128×256 is wave quantization, not L2 residency (see §9).
 - **128×256** (8 acc) — small-M, WG-starved shapes, where a smaller tile spawns more workgroups to
   fill the CUs (`N%256==0`). This is the fall-through of the two above.
-- **Correctness floor** — a shape all three arms decline picks the widest tile that *divides* it:
-  256×256 → 128×256 → 128×384 (`N%256!=0`) → 128×128. 256×256 stays the default for the
-  CU-filling `M%256==0 && N%256==0` case, so nothing that already routed well moves. The floor
-  also subsumes the old `only_exact_route` arm: an `N%256!=0` shape that no perf arm takes lands
-  on the 128×384 line here, so a separate K-gated arm for it would be dead code.
+- **Coverage floor** — a shape all three arms decline picks the widest tile that *reaches* it:
+  256×256 → 128×256 → 128×384 (`N%256!=0`) → **256×256 over a ceil grid** (`N%128==0`, masked last
+  N-tile) → 128×128. 256×256 stays the default for the CU-filling `M%256==0 && N%256==0` case, so
+  nothing that already routed well moves. The floor also subsumes the old `only_exact_route` arm:
+  an `N%256!=0` shape that no perf arm takes lands on the 128×384 line here, so a separate K-gated
+  arm for it would be dead code.
 
 **Why**: At occ1, a large tile on small shapes leaves the grid with fewer workgroups than CUs,
 idling half the machine. The small-M path raises the workgroup count with a smaller tile to fill
@@ -159,7 +160,27 @@ since `wg256=800` makes `wide384` false), and M an odd multiple of 128 on a CU-f
 another clause *inside* it — fixes all three at once and cannot regress a tuned shape, because the
 floor's first line returns exactly the 256×256 the old fall-through did whenever that tile is valid.
 ⚠️ It only reaches as far as the implemented tiles do: an M or N that is not a multiple of 128 still
-truncates, and proper remainder handling is not implemented.
+truncates, and proper remainder handling is not implemented below that granularity.
+
+**The masked last N-tile (`NMASK`).** Dividing is not always enough. `N = 128 * odd` (e.g.
+`102272 = 128 x 799`) has no 256-wide divisor at all, so the floor's only dividing option is
+128×128 — and a 4-acc tile amortizes shallow-K fixed cost over a quarter of the work: measured
+**1273 TFLOPs against 1435** on `2048x102272x1024`. So for `M%256==0 && N%128==0` the router
+returns 256×256 anyway and `dispatch_gemm` launches a `ceil(N/256)` grid with the kernel's `NMASK`
+flag set. Three things change inside, all `if constexpr` so every other route keeps its exact
+codegen:
+
+1. the store drops columns with `n >= N` — this is the one that makes the output correct;
+2. B's block index is clamped to the last real block;
+3. B's scale-group index likewise.
+
+(2) and (3) are bounds guards, not correctness guards: their columns are masked at the store, so
+reading the wrong operand there changes nothing numerically. What they prevent is running off the
+end of B — removing (2) faults with `Memory access fault by GPU node-1` on a large-K partial-N
+shape, where the overshoot is ~10 MB. Removing (3) was **not** observed to fault or to change any
+result; it is kept because the read is out of bounds by spec, not because a test catches it.
+The route needs `(N/32) % NPW == 0`, which for NPW=4 is exactly `N%128==0`, so every real block
+still has a scale group.
 
 `choose_tile` is host code with no HIP dependency, so its decisions are gated by
 `test_gemm --routing` (ctest target `routing`) on machines without a GPU.

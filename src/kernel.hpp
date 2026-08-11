@@ -73,7 +73,7 @@ __device__ __forceinline__ void issue_A_chunks(uint32_t lds_base, int row_stride
 template <int M_TILE, int N_TILE, int K_TILE, int WAVES_M, int WAVES_N, int MIN_OCC = 1,
           int SWZ = 0, typename OutT = float, bool SPLITK = false, bool KGE2 = false,
           int PFD = 5, bool HARD_WAIT = true, int ADRIP_START = 1, int ADRIP_STRIDE = 1,
-          int ADRIP_PER = 1, int ADRIP_STOP = 0>
+          int ADRIP_PER = 1, int ADRIP_STOP = 0, bool NMASK = false>
 __global__ void __launch_bounds__(256, MIN_OCC)
     lds_gemm_hybrid_dripA(const void* __restrict__ A, const void* __restrict__ B,
                           const uint8_t* __restrict__ sA, const uint8_t* __restrict__ sB,
@@ -87,6 +87,22 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     constexpr int A_BYTES = M_TILE * KT_BYTES;
     constexpr int NB = K64_PER_TILE * N_PW;                      // 12 b-stream positions / tile
     constexpr int ISSUES_A = (M_TILE * ROW_CHUNKS + 255) / 256;  // 9 A loads / tile
+
+    // The drip schedule hangs A's loads off the MFMA quartets, so the quartet count is a hard
+    // budget: a tile needs ISSUES_A chunks and only gets ADRIP_PER per issuing quartet. Run out
+    // and the trailing chunks are never issued at all -- the loop below just clamps a0/a1 to
+    // ISSUES_A and moves on, so the tail of the A tile stays whatever the previous tile left in
+    // LDS. That is silent wrong output, not a fault, and it is invisible in the ISA unless you
+    // count buffer_load_lds against M_TILE. Wide-M/narrow-N tiles are where it bites: 256x128 has
+    // ISSUES_A=9 but only NB-1=5 issuing quartets, so it needs ADRIP_PER=2.
+    constexpr int ADRIP_STOP_EFF = (ADRIP_STOP > 0 && ADRIP_STOP <= NB) ? ADRIP_STOP : NB;
+    constexpr int ADRIP_QUARTETS =
+        ADRIP_STOP_EFF > ADRIP_START
+            ? (ADRIP_STOP_EFF - ADRIP_START + ADRIP_STRIDE - 1) / ADRIP_STRIDE
+            : 0;
+    static_assert(ADRIP_QUARTETS * ADRIP_PER >= ISSUES_A,
+                  "A-drip schedule cannot issue every A chunk for this tile: raise ADRIP_PER, "
+                  "lower ADRIP_START, or widen N_TILE (more MFMA quartets to drip into)");
 
     extern __shared__ char smem[];
     int tid = threadIdx.x, wave = tid / 64, lane = tid % 64;
@@ -130,6 +146,21 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     constexpr int NDA = SA_PAD / 4, NDB = SB_PAD / 4;
     static_assert(NDA == 1 && NDB == 1, "tiled-scale path assumes <=4 blocks/wave");
     int sa_grp = wg_m * WAVES_M + wm, sb_grp = wg_n * WAVES_N + wn;
+    // NMASK: N is not a multiple of N_TILE, so the grid is ceil(N/N_TILE) and the LAST N-tile is
+    // only partly inside the matrix. Its out-of-range columns are dropped at the store (below);
+    // the work is still done, it just goes nowhere. What must not happen is the READ side running
+    // off the end of B or of B's scales -- those buffers are sized to the true N, so an
+    // out-of-range block would fault or read a neighbouring allocation. Clamp both indices to the
+    // last valid entry: the operands are then wrong for the masked columns, which is fine because
+    // their accumulators are never stored, and clamping is branch-free (a predicated load would
+    // sit in the MFMA-feeding path). Requires (N/32) % N_PW == 0 so the scale grouping still
+    // covers every real block -- dispatch only takes this path when it does.
+    int b_blk_max = 0, sb_grp_max = 0;
+    if constexpr (NMASK) {
+        b_blk_max = N / 32 - 1;
+        sb_grp_max = (N / 32) / N_PW - 1;
+        sb_grp = sb_grp < sb_grp_max ? sb_grp : sb_grp_max;
+    }
     int k_tiles = k_iters / K64_PER_TILE;
     if constexpr (SPLITK) {
         int z = blockIdx.z, seg_floor = kt_base, seg_rem = k_tiles_seg;
@@ -167,8 +198,10 @@ __global__ void __launch_bounds__(256, MIN_OCC)
         for (int q = 0; q < PFD; q++)
             if (q < NB) {
                 int s = q / N_PW, n = q % N_PW, blk = wn * N_PW + n;
+                int bg = wg_n * N_BLKS + blk;
+                if constexpr (NMASK) bg = bg < b_blk_max ? bg : b_blk_max;
                 bring[q] = load_b_shuf(reinterpret_cast<const char*>(B), k_iters,
-                                       wg_n * N_BLKS + blk, (kt_base + kt_cur) * K64_PER_TILE + s, lane);
+                                       bg, (kt_base + kt_cur) * K64_PER_TILE + s, lane);
                 sbring[q] = (sb[s][n / 4] >> (8 * (n % 4))) & 0xff;
             }
         v6i a[M_PW];
@@ -188,8 +221,10 @@ __global__ void __launch_bounds__(256, MIN_OCC)
             int sbv_cur = sbring[p % PFD];
             if (p + PFD < NB) {
                 int np = p + PFD, ns = np / N_PW, nn = np % N_PW, nblk = wn * N_PW + nn;
+                int nbg = wg_n * N_BLKS + nblk;
+                if constexpr (NMASK) nbg = nbg < b_blk_max ? nbg : b_blk_max;
                 bring[(p + PFD) % PFD] =
-                    load_b_shuf(reinterpret_cast<const char*>(B), k_iters, wg_n * N_BLKS + nblk,
+                    load_b_shuf(reinterpret_cast<const char*>(B), k_iters, nbg,
                                 (kt_base + kt_cur) * K64_PER_TILE + ns, lane);
                 sbring[(p + PFD) % PFD] = (sb[ns][nn / 4] >> (8 * (nn % 4))) & 0xff;
             }
@@ -250,6 +285,9 @@ __global__ void __launch_bounds__(256, MIN_OCC)
 #pragma unroll
         for (int ni = 0; ni < N_PW; ni++) {
             int n = wg_n * N_TILE + (wn * N_PW + ni) * 32 + (lane & 31);
+            if constexpr (NMASK) {
+                if (n >= N) continue;  // partial last N-tile: this column is past the matrix
+            }
             int nh = lane >> 5;
             int mb = wg_m * M_TILE + (wm * M_PW + mi) * 32;
             const v16f& a = acc[mi][ni].vec;

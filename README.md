@@ -269,13 +269,16 @@ gives a safe scale tail automatically). Same result, but A is padded per-row.
 - **K must be a multiple of 32** (the MX block size). It is then padded internally to `kpad(K)`
   (a multiple of `K_TILE`=192) — pass `kpad(K)` as the kernel's `Kp`. ⚠️ A K that is not a
   multiple of 32 is silently mis-quantized in a release build (the `assert` is compiled out).
-- **M and N must be multiples of 128.** Multiples of 256 hit the workhorse 256×256 tile; the
-  128-wide routes cover the rest (N a multiple of 384 → 128×384, of 256 → 128×256, otherwise
-  128×128). `choose_tile()` treats divisibility as a hard floor: if the perf arms — which are gated
-  on CU fill and on `Kp` — all decline, it still returns the widest tile that *divides* the shape
-  rather than the fastest one. ⚠️ Below that, the grid is launched with integer division and there
-  is **no remainder handling**, so an M or N that is not a multiple of 128 silently drops the
-  remainder rows/cols. Pad up to 128, or check `choose_tile(M,N,Kp).MT/.NT` divide your M/N.
+- **M must be a multiple of 128; N a multiple of 128.** `choose_tile()` treats coverage as a hard
+  floor below its perf arms: if the arms — which are gated on CU fill and on `Kp` — all decline, it
+  still returns a tile that *reaches the whole shape* rather than the fastest one. M is always
+  covered by division. N is covered either by division (a multiple of 384 → 128×384, of 256 →
+  128×256 / 256×256, otherwise 128×128) or, when `N%128==0` but nothing 256-wide divides it, by
+  running 256×256 over a `ceil(N/256)` grid and masking the last N-tile's out-of-range columns at
+  the store. That masked route is why `N=102272` is both correct and fast — the tile that divides
+  it (128×128) costs 12.7%. ⚠️ There is **no M-remainder handling** and no N-remainder handling
+  below 128, so an M or N that is not a multiple of 128 silently drops the remainder rows/cols.
+  Pad up to 128.
 - **B is transposed by `preprocess_B`.** Pass B in its natural `[K][N]` row-major layout; the
   helper produces `Bᵀ[N][K]` and quantizes it.
 - **Scale grouping must match the tile.** Use `choose_tile(M,N,Kp).MPW` for A's `tile_scale` and

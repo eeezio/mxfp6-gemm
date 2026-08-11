@@ -36,6 +36,8 @@ inline int splitk_S(int M, int N, int Kp) {
     // launches a kernel whose NPW disagrees with the scales the caller tiled from choose_tile(),
     // which is silently wrong at small K and a memory fault at large K.
     if (tc.NT == 384 || tc.NT == 128) return 1;
+    // Nor one with a partial last N-tile: base_wg below would floor the remainder tile away.
+    if (N % tc.NT != 0) return 1;
     int k_tiles = (Kp / 64) / (KT / 64);    // total deep tiles for full K = Kp/192
     int base_wg = (M / tc.MT) * (N / tc.NT);
     int S = 1;
@@ -152,6 +154,18 @@ inline void dispatch_gemm_kge(int M, int N, int Kp, const void* dA, const void* 
                 <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                                   0, k_tiles, nullptr);
         }
+    } else if (N % 256 != 0) {
+        // 256x256 over a CEIL grid: the last N-tile hangs off the end of the matrix and its
+        // out-of-range columns are dropped at the store (NMASK). Taken for N%128==0, N%256!=0,
+        // where the only tile that divides N is 128x128 -- and a 4-acc tile amortizes the
+        // shallow-K fixed cost over a quarter of the work, which costs far more than wasting
+        // half of one N-tile out of ceil(N/256).
+        dim3 g(M / 256, (N + 255) / 256);
+        int lds = 2 * (256 * (KT * 6 / 8));
+        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, 5, true, 1, 1, 1,
+                              0, true>
+            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
+                              0, k_tiles, nullptr);
     } else {
         dim3 g(M / 256, N / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
@@ -202,6 +216,18 @@ inline void dispatch_gemm_force_tile_kge(int M, int N, int Kp, TileChoice tc, co
         dim3 g(M / 128, N / 256);
         int lds = 2 * (128 * (KT * 6 / 8));
         lds_gemm_hybrid_dripA<128, 256, KT, 2, 2, 1, 0, OutT, false, KGE2>
+            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
+                              0, k_tiles, nullptr);
+    } else if (N % 256 != 0) {
+        // 256x256 over a CEIL grid: the last N-tile hangs off the end of the matrix and its
+        // out-of-range columns are dropped at the store (NMASK). Taken for N%128==0, N%256!=0,
+        // where the only tile that divides N is 128x128 -- and a 4-acc tile amortizes the
+        // shallow-K fixed cost over a quarter of the work, which costs far more than wasting
+        // half of one N-tile out of ceil(N/256).
+        dim3 g(M / 256, (N + 255) / 256);
+        int lds = 2 * (256 * (KT * 6 / 8));
+        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, 5, true, 1, 1, 1,
+                              0, true>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     } else {
