@@ -60,7 +60,12 @@ size_t gemm_workspace_size(int M, int N, int Kp);
 //   ws/ws_bytes : caller-provided split-K workspace (device). Size with gemm_workspace_size().
 //     Pass (nullptr, 0) to never split. If a shape would split but ws is null/too small, gemm()
 //     runs unsplit (still correct, just without the speedup) and logs a warning to stderr.
+// K_real: the caller's UNPADDED K. Optional -- 0 means "not supplied" and every K sub-slab of
+// every tile is computed, which is what the padded operands make correct anyway. Supplying it
+// lets the kernel skip the last tile's all-pad sub-slabs (both their MFMA and their B loads),
+// which is 11% of the work at K=1024 (Kp=1152). Must satisfy kpad(K_real) == Kp.
 void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, const uint8_t* dsA,
-          const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes, void* ws, size_t ws_bytes);
+          const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes, void* ws, size_t ws_bytes,
+          int K_real = 0);
 
 }  // namespace mxfp6

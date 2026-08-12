@@ -64,20 +64,23 @@ size_t gemm_workspace_size(int M, int N, int Kp) {
 
 void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, const uint8_t* dsA,
           const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes, void* ws,
-          size_t ws_bytes) {
+          size_t ws_bytes, int K_real) {
+    // A K_real that does not pad to this Kp would make the kernel skip REAL work, so drop it
+    // rather than trust it. 0 disables the short-tail path entirely.
+    if (K_real > 0 && kpad(K_real) != Kp) K_real = 0;
     switch (ot) {
         case OutType::F32:
             detail::dispatch_gemm<float>(M, N, Kp, dA, dBsh, dsA, dsB, static_cast<float*>(dD),
-                                         A_row_bytes, B_row_bytes, ws, ws_bytes);
+                                         A_row_bytes, B_row_bytes, ws, ws_bytes, K_real);
             break;
         case OutType::F16:
             detail::dispatch_gemm<__half>(M, N, Kp, dA, dBsh, dsA, dsB, static_cast<__half*>(dD),
-                                          A_row_bytes, B_row_bytes, ws, ws_bytes);
+                                          A_row_bytes, B_row_bytes, ws, ws_bytes, K_real);
             break;
         case OutType::BF16:
             detail::dispatch_gemm<__hip_bfloat16>(M, N, Kp, dA, dBsh, dsA, dsB,
                                                   static_cast<__hip_bfloat16*>(dD), A_row_bytes,
-                                                  B_row_bytes, ws, ws_bytes);
+                                                  B_row_bytes, ws, ws_bytes, K_real);
             break;
     }
 }
@@ -88,20 +91,21 @@ void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, co
 // wrong output). No split-K.
 void gemm_force_tile(OutType ot, int M, int N, int Kp, TileChoice tc, const void* dA,
                      const void* dBsh, const uint8_t* dsA, const uint8_t* dsB, void* dD,
-                     int A_row_bytes, int B_row_bytes) {
+                     int A_row_bytes, int B_row_bytes, int K_real) {
+    if (K_real > 0 && kpad(K_real) != Kp) K_real = 0;
     switch (ot) {
         case OutType::F32:
             detail::dispatch_gemm_force_tile<float>(M, N, Kp, tc, dA, dBsh, dsA, dsB,
-                                                    static_cast<float*>(dD), A_row_bytes, B_row_bytes);
+                                                    static_cast<float*>(dD), A_row_bytes, B_row_bytes, K_real);
             break;
         case OutType::F16:
             detail::dispatch_gemm_force_tile<__half>(M, N, Kp, tc, dA, dBsh, dsA, dsB,
-                                                     static_cast<__half*>(dD), A_row_bytes, B_row_bytes);
+                                                     static_cast<__half*>(dD), A_row_bytes, B_row_bytes, K_real);
             break;
         case OutType::BF16:
             detail::dispatch_gemm_force_tile<__hip_bfloat16>(M, N, Kp, tc, dA, dBsh, dsA, dsB,
                                                               static_cast<__hip_bfloat16*>(dD),
-                                                              A_row_bytes, B_row_bytes);
+                                                              A_row_bytes, B_row_bytes, K_real);
             break;
     }
 }

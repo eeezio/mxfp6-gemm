@@ -9,6 +9,8 @@
 // (blk, sub, lane) the same 24 contiguous FP6 bytes live in global at
 //   Bg + (blk*32 + lane%32)*B_row_bytes + kt*KT_BYTES + sub*48 + (lane>>5)*24
 // (load_b_shuf reads them from the preshuffle_B layout instead, coalesced).
+#include <type_traits>
+
 #include "device_ops.hpp"
 namespace mxfp6 {
 
@@ -73,7 +75,7 @@ __device__ __forceinline__ void issue_A_chunks(uint32_t lds_base, int row_stride
 template <int M_TILE, int N_TILE, int K_TILE, int WAVES_M, int WAVES_N, int MIN_OCC = 1,
           int SWZ = 0, typename OutT = float, bool SPLITK = false, bool KGE2 = false,
           int PFD = 5, bool HARD_WAIT = true, int ADRIP_START = 1, int ADRIP_STRIDE = 1,
-          int ADRIP_PER = 1, int ADRIP_STOP = 0, bool NMASK = false>
+          int ADRIP_PER = 1, int ADRIP_STOP = 0, bool NMASK = false, int TAIL_SUBS = 0>
 __global__ void __launch_bounds__(256, MIN_OCC)
     lds_gemm_hybrid_dripA(const void* __restrict__ A, const void* __restrict__ B,
                           const uint8_t* __restrict__ sA, const uint8_t* __restrict__ sB,
@@ -140,6 +142,11 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     constexpr int SA_PAD = ((M_PW + 3) / 4) * 4, SB_PAD = ((N_PW + 3) / 4) * 4;
     constexpr int NDA = SA_PAD / 4, NDB = SB_PAD / 4;
     static_assert(NDA == 1 && NDB == 1, "tiled-scale path assumes <=4 blocks/wave");
+    // TAIL_SUBS drops the trailing all-pad sub-slabs of the LAST tile of the whole K. Under split-K
+    // "last tile" is per segment, and only the final segment's is the padded one, so the two are
+    // incompatible until that is threaded through.
+    static_assert(TAIL_SUBS >= 0 && TAIL_SUBS <= K64_PER_TILE, "TAIL_SUBS range");
+    static_assert(!(TAIL_SUBS && SPLITK), "TAIL_SUBS is not implemented for split-K");
     int sa_grp = wg_m * WAVES_M + wm, sb_grp = wg_n * WAVES_N + wn;
     // NMASK: ceil(N/N_TILE) grid, so the last N-tile is only partly inside the matrix. The store
     // drops its out-of-range columns (below); these two clamps keep the READ side inside B and
@@ -180,14 +187,19 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     };
 
     // compute tile kt_cur from buffer `cur`; if adrip, drip A(kt_nxt) into buffer nxt_base.
-    auto compute = [&](uint32_t cur, uint32_t nxt_base, int kt_cur, int kt_nxt, bool adrip,
-                       const int (*sa)[NDA], const int (*sb)[NDB]) {
+    // SUBS_T is a compile-time count of 64-K sub-slabs to actually run (an integral_constant, so
+    // NB_EFF folds and the p loop stays fully unrolled). Every tile but the last passes
+    // K64_PER_TILE; the last tile passes TAIL_SUBS when the caller told us how much of the padded
+    // K is real, which drops the all-zero sub-slabs' MFMA *and* their B loads.
+    auto compute = [&](auto SUBS_T, uint32_t cur, uint32_t nxt_base, int kt_cur, int kt_nxt,
+                       bool adrip, const int (*sa)[NDA], const int (*sb)[NDB]) {
+        constexpr int NB_EFF = decltype(SUBS_T)::value * N_PW;
         int kb_nxt = (kt_base + kt_nxt) * KT_BYTES;
         v6i bring[PFD];
         int sbring[PFD];
 #pragma unroll
         for (int q = 0; q < PFD; q++)
-            if (q < NB) {
+            if (q < NB_EFF) {
                 int s = q / N_PW, n = q % N_PW, blk = wn * N_PW + n;
                 int bg = wg_n * N_BLKS + blk;
                 if constexpr (NMASK) bg = bg < b_blk_max ? bg : b_blk_max;
@@ -198,7 +210,7 @@ __global__ void __launch_bounds__(256, MIN_OCC)
         v6i a[M_PW];
         int sav[M_PW];
 #pragma unroll
-        for (int p = 0; p < NB; p++) {
+        for (int p = 0; p < NB_EFF; p++) {
             int sub = p / N_PW, ni = p % N_PW;
             if (ni == 0) {
 #pragma unroll
@@ -210,7 +222,7 @@ __global__ void __launch_bounds__(256, MIN_OCC)
             }
             v6i b_cur = bring[p % PFD];
             int sbv_cur = sbring[p % PFD];
-            if (p + PFD < NB) {
+            if (p + PFD < NB_EFF) {
                 int np = p + PFD, ns = np / N_PW, nn = np % N_PW, nblk = wn * N_PW + nn;
                 int nbg = wg_n * N_BLKS + nblk;
                 if constexpr (NMASK) nbg = nbg < b_blk_max ? nbg : b_blk_max;
@@ -246,23 +258,54 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     load_scales(0, sa0, sb0);
     issue_A_chunks<ROW_CHUNKS, M_TILE * ROW_CHUNKS>(0, A_row_bytes, kt_base * KT_BYTES, wave, lane,
                                                     arsrc, 0, ISSUES_A);
+    constexpr auto FULL = std::integral_constant<int, K64_PER_TILE>{};
+    constexpr auto TAIL = std::integral_constant<int, TAIL_SUBS ? TAIL_SUBS : K64_PER_TILE>{};
+    // With TAIL_SUBS the last tile is short, so the pairwise loop covers one tile fewer. The drip
+    // lookahead still uses k_tiles_seg: the short tile's A must be dripped like any other (only
+    // its own MFMA/B are dropped, its LDS staging is not).
+    int n_full = k_tiles_seg - (TAIL_SUBS ? 1 : 0);
     int kt = 0;
     if constexpr (KGE2) __builtin_assume(k_tiles_seg >= 2);
-    for (; kt + 1 < k_tiles_seg; kt += 2) {
+    for (; kt + 1 < n_full; kt += 2) {
         if (HARD_WAIT) wait_vmcnt(0);
         __syncthreads();
         load_scales(kt + 1, sa1, sb1);
-        compute(0, A_BYTES, kt, kt + 1, true, sa0, sb0);  // compute buf0, drip A(kt+1)->buf1
+        compute(FULL, 0, A_BYTES, kt, kt + 1, true, sa0, sb0);  // compute buf0, drip A(kt+1)->buf1
         bool pf = (kt + 2 < k_tiles_seg);
         if (HARD_WAIT) wait_vmcnt(0);
         __syncthreads();
         if (pf) load_scales(kt + 2, sa0, sb0);
-        compute(A_BYTES, 0, kt + 1, kt + 2, pf, sa1, sb1);  // compute buf1, drip A(kt+2)->buf0
+        // compute buf1, drip A(kt+2)->buf0
+        compute(FULL, A_BYTES, 0, kt + 1, kt + 2, pf, sa1, sb1);
     }
-    if (kt < k_tiles_seg) {
+    // kt is even here, so it is either n_full-1 (one full tile left, in buf0) or n_full (none).
+    if constexpr (TAIL_SUBS) {
+        // The short last tile, peeled out of the pairwise loop. Two things here are load-bearing:
+        //  * ONE inlined copy of the short compute, not one per buffer parity -- a second copy
+        //    pins these kernels at arch=256 and spills 300-600 bytes.
+        //  * Its scales are re-read into DEDICATED arrays rather than selecting sa0/sa1 through a
+        //    runtime pointer. Taking the address of those arrays makes them escape, LLVM puts them
+        //    in scratch, and the scratch traffic interleaves with load_scales's vmcnt-invisible
+        //    inline-asm loads -- which reads the registers before the loads land. That produced a
+        //    memory fault, not a wrong number, and `vgpr_spill_count` stays 0 the whole time.
+        //    Re-reading costs two dwordx3 on the last tile only.
+        uint32_t tail_buf = 0;
+        if (kt < n_full) {  // odd n_full: one full tile left in buf0, the short tile follows in buf1
+            if (HARD_WAIT) wait_vmcnt(0);
+            __syncthreads();
+            compute(FULL, 0, A_BYTES, kt, kt + 1, true, sa0, sb0);
+            kt++;
+            tail_buf = A_BYTES;
+        }
+        int sat[K64_PER_TILE][NDA], sbt[K64_PER_TILE][NDB];
+        load_scales(kt, sat, sbt);
         wait_vmcnt(0);
         __syncthreads();
-        compute(0, 0, kt, 0, false, sa0, sb0);
+        compute(TAIL, tail_buf, 0, kt, 0, false, sat, sbt);
+    } else if (kt < k_tiles_seg) {
+        wait_vmcnt(0);
+        __syncthreads();
+        compute(FULL, 0, 0, kt, 0, false, sa0, sb0);
     }
 
     // EPILOGUE — naturally COALESCED, no transpose. The swapped-operand MFMA above made acc hold

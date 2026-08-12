@@ -26,7 +26,7 @@ static constexpr int KT = K_TILE;
 namespace mxfp6 {
 void gemm_force_tile(OutType ot, int M, int N, int Kp, TileChoice tc, const void* dA,
                      const void* dBsh, const uint8_t* dsA, const uint8_t* dsB, void* dD,
-                     int A_row_bytes, int B_row_bytes);
+                     int A_row_bytes, int B_row_bytes, int K_real = 0);
 }  // namespace mxfp6
 
 template <class F>
@@ -111,7 +111,7 @@ static bool verify(int M, int N, int K, bool force_ws = false) {
     size_t wsb = gemm_workspace_size(M, N, x.Kp);
     if (!wsb && force_ws) wsb = (size_t)4 * M * N * sizeof(float);
     if (wsb) hipMalloc(&ws, wsb);
-    gemm(OutType::F32, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb);
+    gemm(OutType::F32, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb, K);
     hipDeviceSynchronize();
     std::vector<float> Dg((size_t)M * N);
     hipMemcpy(Dg.data(), dD, (size_t)M * N * 4, hipMemcpyDeviceToHost);
@@ -223,6 +223,34 @@ static bool verify_128x128(int M, int N, int K) {
     }
     bool ok = er < 2e-2f * fmaxf(1.f, mx);
     printf("  128x128 %4dx%4dx%4d : %s\n", M, N, K, ok ? "OK" : "FAIL<<<");
+    teardown(x);
+    return ok;
+}
+
+// Correctness check for the 256x256 SHORT-TAIL path on SMALL shapes. The routed short tail only
+// fires at N >= BRING8_MIN_N (105728-class), which no CPU reference can check, so force the tile
+// and hand it the true K. Pick K with (K/64)%3 == 1 to make the last of the k-tiles carry one real
+// 64-K sub-slab and two of pure padding. M and N must be multiples of 256.
+static bool verify_256x256_tail(int M, int N, int K) {
+    constexpr TileChoice tc = {256, 256, 4, 4};
+    Dev x = setup(M, N, K, tc);
+    std::vector<float> Dref((size_t)M * N);
+    mxfp6_gemm_ref(x.Aq, x.Bq, Dref.data(), M, x.Kp, N);
+    float* dD;
+    hipMalloc(&dD, (size_t)M * N * 4);
+    hipMemset(dD, 0x5A, (size_t)M * N * 4);
+    gemm_force_tile(OutType::F32, M, N, x.Kp, tc, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, K);
+    hipDeviceSynchronize();
+    std::vector<float> Dg((size_t)M * N);
+    hipMemcpy(Dg.data(), dD, (size_t)M * N * 4, hipMemcpyDeviceToHost);
+    hipFree(dD);
+    float er = 0, mx = 0;
+    for (size_t i = 0; i < (size_t)M * N; i++) {
+        er = fmaxf(er, fabsf(Dg[i] - Dref[i]));
+        mx = fmaxf(mx, fabsf(Dref[i]));
+    }
+    bool ok = er < 2e-2f * fmaxf(1.f, mx);
+    printf("  256x256 tail %4dx%4dx%4d (Kp=%d) : %s\n", M, N, K, x.Kp, ok ? "OK" : "FAIL<<<");
     teardown(x);
     return ok;
 }
@@ -377,7 +405,7 @@ static void perf(int M, int N, int K) {
     size_t wsb = gemm_workspace_size(M, N, x.Kp);
     if (wsb) hipMalloc(&ws, wsb);
     auto run = [&] {
-        gemm(OutType::F16, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb);
+        gemm(OutType::F16, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb, K);
     };
     double ms = bench(run);
     int base_wg = (M / tc.MT) * (N / tc.NT);
@@ -402,6 +430,14 @@ int main(int argc, char** argv) {
     f += !verify(512, 512, 768);    // -> 128x256 path (wg256<CU)
     f += !verify(768, 1280, 960);   // -> 128x256, non-square
     f += !verify(4096, 4096, 768);  // -> 256x256 path (wg256=256), small K for fast ref
+    // Short-tail path (TAIL_SUBS): the last k-tile is 1 real 64-K sub-slab + 2 of pure padding.
+    // Both buffer parities matter -- the tile count decides whether the short tile lands in the
+    // first or the second LDS buffer, and an early version of the peel got one of them wrong.
+    f += !verify_256x256_tail(256, 256, 1024);  // Kp=1152, 6 k-tiles -> short tile in buffer 1
+    f += !verify_256x256_tail(256, 512, 1600);  // Kp=1728, 9 k-tiles -> short tile in buffer 0
+    // Two padding sub-slabs instead of one ((K/64)%3 == 2), again both parities.
+    f += !verify_256x256_tail(256, 256, 320);   // Kp=384,  2 k-tiles -> short tile in buffer 1
+    f += !verify_256x256_tail(256, 512, 512);   // Kp=576,  3 k-tiles -> short tile in buffer 0
     // pad-B-only / compact-A recipe. K = multiple of 32 (MX block) but NOT of K_TILE, so a real
     // K-tail exists (exercises the inter-row overlap + end pad + NaN-safe scale tail):
     f += !verify_compact(4096, 4096, 224);  // -> 256x256, 2 k_tiles
