@@ -8,6 +8,7 @@
 // ONE kernel paradigm (hybrid drip-A: A staged deep-K in LDS double-buffered + B streamed
 // coalesced HBM->VGPR ring + dripped A loads + RDB barrier + tiled-scale), routed by shape:
 //   * 256x256 (16-acc sweet spot) — workhorse for CU-filling shapes.
+//   * 128x384 (12-acc, WAVES_M=1/WAVES_N=4) — moderate-K wide-N, perfect CU fill when N%384==0.
 //   * 128x256 (8-acc)             — WG-starved small-M, to fill idle CUs.
 //   * 128x128 (4-acc)             — large-K wide-N, shrinks B working set to fit L2.
 // Same lds_gemm_hybrid_dripA kernel for all (tile-general); only the tile args differ.
@@ -25,6 +26,10 @@ inline int splitk_S(int M, int N, int Kp) {
     constexpr int CU = 256;                 // MI350X (gfx950)
     constexpr int MIN_TILES_PER_SEG = 8;    // min deep tiles per segment (amortize prologue + small-K gate)
     TileChoice tc = choose_tile(M, N, Kp);
+    // The split path only implements the 128x256 and 256x256 kernels. Splitting any other tile
+    // launches a kernel whose NPW disagrees with the scales the caller tiled from choose_tile(),
+    // which is silently wrong at small K and a memory fault at large K.
+    if (tc.NT == 384 || tc.NT == 128) return 1;
     int k_tiles = (Kp / 64) / (KT / 64);    // total deep tiles for full K = Kp/192
     int base_wg = (M / tc.MT) * (N / tc.NT);
     int S = 1;
@@ -74,9 +79,8 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
         int seg_floor = k_tiles / S, seg_rem = k_tiles % S;
         size_t total = (size_t)M * N;
         float* Dpart = static_cast<float*>(ws);
-        // Note: the 128x128 tile never reaches the split path — it is chosen only when wg128>=CU
-        // (see choose_tile), which makes base_wg>=CU, so splitk_S() returns S=1. Only the 128x256
-        // and 256x256 tiles can be WG-starved enough to split along K.
+        // Only the 128x256 and 256x256 tiles are implemented here; splitk_S() returns S=1 for
+        // every other tile so this branch cannot be reached with one.
         if (tc.MT == 128) {
             dim3 g(M / 128, N / 256, S);
             int lds = 2 * (128 * (KT * 6 / 8));
@@ -102,6 +106,15 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
         dim3 g(M / 128, N / 128);
         int lds = 2 * (128 * (KT * 6 / 8));
         lds_gemm_hybrid_dripA<128, 128, KT, 2, 2, 1, 0, OutT, false>
+            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
+                              0, k_tiles, nullptr);
+    } else if (tc.MT == 128 && tc.NT == 384) {
+        // 128x384 tile: moderate-K wide-N path — perfect CU fill (256 WGs), 12 acc/wave.
+        // WAVES_M=1, WAVES_N=4 → N_PW=3 ≤ 4 (satisfies scale static_assert).
+        // NB=9 but compute/B-slot = 1152/9 = 128 cyc (vs 64 for 128x256) → deeper look-ahead.
+        dim3 g(M / 128, N / 384);
+        int lds = 2 * (128 * (KT * 6 / 8));
+        lds_gemm_hybrid_dripA<128, 384, KT, 1, 4, 1, 0, OutT, false>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     } else if (tc.MT == 128) {
@@ -148,6 +161,12 @@ inline void dispatch_gemm_force_tile(int M, int N, int Kp, TileChoice tc, const 
         dim3 g(M / 128, N / 128);
         int lds = 2 * (128 * (KT * 6 / 8));
         lds_gemm_hybrid_dripA<128, 128, KT, 2, 2, 1, 0, OutT, false>
+            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
+                              0, k_tiles, nullptr);
+    } else if (tc.MT == 128 && tc.NT == 384) {
+        dim3 g(M / 128, N / 384);
+        int lds = 2 * (128 * (KT * 6 / 8));
+        lds_gemm_hybrid_dripA<128, 384, KT, 1, 4, 1, 0, OutT, false>
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     } else if (tc.MT == 128) {

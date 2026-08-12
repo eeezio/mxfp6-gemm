@@ -107,21 +107,57 @@ load fetch all of a wave's scales for an entire K_TILE — minimizing the number
 
 ---
 
-## 6. Shape routing: two-tile dispatch
+## 6. Shape routing: four-tile dispatch
 
-**What**: `choose_tile(M,N,Kp)` selects between three tiles:
-- **256×256** (16 acc) — the workhorse for CU-filling shapes (default).
-- **128×256** (8 acc) — small-M, WG-starved shapes, where a smaller tile spawns more workgroups to
-  fill the CUs (`(M/256)*(N/256) < CU && M%128==0 && N%256==0`).
+**What**: `choose_tile(M,N,Kp)` selects between four tiles. It runs two stages: a *perf* stage of
+three arms, each gated on `(M/256)*(N/256) < CU && M%128==0`, then a *correctness floor*.
+
 - **128×128** (4 acc) — large-K wide-N shapes where B's per-N-slice working set overflows L2
-  (`(M/256)*(N/256) < CU && Kp≥32768 && (M/128)*(N/128) ≥ CU`). Halving the N-tile halves the
-  B working set streamed per workgroup, restoring L2 residency (see §9).
+  (`Kp≥32768 && (M/128)*(N/128) ≥ CU`). Halving the N-tile halves the B working set streamed per
+  workgroup, restoring L2 residency (see §9).
+- **128×384** (12 acc, `WAVES_M=1`/`WAVES_N=4`) — moderate-K wide-N shapes (`N%384==0 &&
+  Kp<LARGEK_THRESH`) where 128×256 wastes a CU wave. Taken when it saves a whole wave.
+- **128×256** (8 acc) — small-M, WG-starved shapes, where a smaller tile spawns more workgroups to
+  fill the CUs (`N%256==0`). This is the fall-through of the two above.
+- **Correctness floor** — a shape all three arms decline picks the widest tile that *divides* it:
+  256×256 → 128×256 → 128×384 (`N%256!=0`) → 128×128. 256×256 stays the default for the
+  CU-filling `M%256==0 && N%256==0` case, so nothing that already routed well moves.
 
 **Why**: At occ1, a large tile on small shapes leaves the grid with fewer workgroups than CUs,
 idling half the machine. The small-M path raises the workgroup count with a smaller tile to fill
 the CUs, while **reusing the entire hybrid machinery** (drip-A, B-direct, swapped-C) — only the
-tile template parameters change; no new kernel is introduced. The 128×128 path is the same
-machinery again, chosen only when the *cache*, not the CU count, is the binding constraint (§9).
+tile template parameters change; no new kernel is introduced. The 128×128 and 128×384 paths are that
+same machinery again, chosen when something other than raw workgroup count binds: the *cache* for
+128×128 (§9), and *wave quantization* for 128×384.
+
+**The 128×384 cost model.** Filling the CUs is not a sufficient test for a wider tile, because a
+128×384 workgroup does 1.5× the work of a 128×256 one — it only pays when it saves a whole CU wave.
+So the gate compares wave-quantized cost (scaled by 2 to stay integer):
+
+```
+cost384 = 3 * ceil(wg384 / CU)      cost256 = 2 * ceil(wg256_grid / CU)
+```
+
+`M=2048, N=6144` gives 3·1 = 3 against 2·2 = 4, so it is taken (measured 1.59× on MI350X, more than
+the 1.33× the model alone predicts — the rest is the 8→12 accumulators-per-wave ILP bonus).
+`N=6912`/`7680` give 3·2 = 6 against 2·2 = 4 and are rejected: both tiles need two waves there, so
+the bigger workgroup is pure loss. Ties reject, since the extra accumulators may well win in the tie
+band but that is unmeasured.
+
+**Why the correctness floor is separate from the cost model.** All three perf arms are gated on
+`wg256 < CU`, and two of them on `Kp` as well, so any shape they decline used to land on 256×256
+unconditionally — and the grid is launched with integer division, so a 256 that does not divide M or
+N silently drops the remainder. Three families hit this: `N%384==0 && N%256!=0` at `Kp≥32768`
+(`M=256, N=384, K=32768` → `dim3(1,1)`, columns 256..383 never written), the same N on a CU-filling
+grid (`M=8192, N=6528` at any K, since `wg256=800`), and M an odd multiple of 128 on a CU-filling
+grid (`M=896`, last 128 rows dropped). Making divisibility a floor *below* the cost model — rather
+than another clause *inside* it — fixes all three at once and cannot regress a tuned shape, because
+the floor's first line returns exactly the 256×256 the old fall-through did whenever that tile is
+valid. ⚠️ It only reaches as far as the implemented tiles do: an M or N that is not a multiple of
+128 still truncates, and proper remainder handling is not implemented.
+
+`choose_tile` is host code with no HIP dependency, so its decisions are gated by
+`test_gemm --routing` (ctest target `routing`) on machines without a GPU.
 
 ---
 

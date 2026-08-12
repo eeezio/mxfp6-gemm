@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -95,7 +96,9 @@ static void teardown(Dev& x) {
     hipFree(x.dsB);
 }
 
-static bool verify(int M, int N, int K) {
+// force_ws: hand gemm() a split-K workspace even when gemm_workspace_size() says none is needed,
+// so a route that must not split is checked under the same call shape a splitting caller uses.
+static bool verify(int M, int N, int K, bool force_ws = false) {
     int Kp_est = ((K + K_TILE - 1) / K_TILE) * K_TILE;
     TileChoice tc = choose_tile(M, N, Kp_est);
     Dev x = setup(M, N, K, tc);
@@ -106,6 +109,7 @@ static bool verify(int M, int N, int K) {
     hipMemset(dD, 0x5A, (size_t)M * N * 4);
     void* ws = nullptr;
     size_t wsb = gemm_workspace_size(M, N, x.Kp);
+    if (!wsb && force_ws) wsb = (size_t)4 * M * N * sizeof(float);
     if (wsb) hipMalloc(&ws, wsb);
     gemm(OutType::F32, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb);
     hipDeviceSynchronize();
@@ -119,7 +123,8 @@ static bool verify(int M, int N, int K) {
         mx = fmaxf(mx, fabsf(Dref[i]));
     }
     bool ok = er < 2e-2f * fmaxf(1.f, mx);
-    printf("  %4dx%4dx%4d -> %dx%d : %s\n", M, N, K, tc.MT, tc.NT, ok ? "OK" : "FAIL<<<");
+    printf("  %4dx%4dx%4d -> %dx%d%s : %s\n", M, N, K, tc.MT, tc.NT, force_ws ? " +ws" : "",
+           ok ? "OK" : "FAIL<<<");
     teardown(x);
     return ok;
 }
@@ -222,6 +227,125 @@ static bool verify_128x128(int M, int N, int K) {
     return ok;
 }
 
+// Correctness check for the 128x384 kernel path on SMALL shapes (fast CPU ref).
+// Uses WAVES_M=1, WAVES_N=4: MPW=4, NPW=3. M must be a multiple of 128; N of 384.
+static bool verify_128x384(int M, int N, int K) {
+    constexpr TileChoice tc = {128, 384, 4, 3};
+    Dev x = setup(M, N, K, tc);
+    std::vector<float> Dref((size_t)M * N);
+    mxfp6_gemm_ref(x.Aq, x.Bq, Dref.data(), M, x.Kp, N);
+    float* dD;
+    hipMalloc(&dD, (size_t)M * N * 4);
+    hipMemset(dD, 0x5A, (size_t)M * N * 4);
+    gemm_force_tile(OutType::F32, M, N, x.Kp, tc, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br);
+    hipDeviceSynchronize();
+    std::vector<float> Dg((size_t)M * N);
+    hipMemcpy(Dg.data(), dD, (size_t)M * N * 4, hipMemcpyDeviceToHost);
+    hipFree(dD);
+    float er = 0, mx = 0;
+    for (size_t i = 0; i < (size_t)M * N; i++) {
+        er = fmaxf(er, fabsf(Dg[i] - Dref[i]));
+        mx = fmaxf(mx, fabsf(Dref[i]));
+    }
+    bool ok = er < 2e-2f * fmaxf(1.f, mx);
+    printf("  128x384 %4dx%4dx%4d : %s\n", M, N, K, ok ? "OK" : "FAIL<<<");
+    teardown(x);
+    return ok;
+}
+
+static bool check_routing() {
+    struct Case {
+        int M, N, K, MT, NT;
+        const char* why;
+    };
+    // clang-format off
+    static const Case cases[] = {
+        {2048,  6144, 16128, 128, 384, "wave 2->1, measured 1.59x"},
+        {2048,  6144,   512, 128, 384, "same, small K"},
+        {4096,  3072, 16128, 128, 384, "wg384=256"},
+        {8192,  1536, 16128, 128, 384, "wg384=256"},
+        {16384,  768, 16128, 128, 384, "wg384=256"},
+        {1024, 12288, 16128, 128, 384, "wg384=256"},
+        {2048,  6912, 16128, 128, 256, "wg384=288 -> 2 waves, no saving"},
+        {2048,  7680, 16128, 128, 256, "wg384=320 -> 2 waves, no saving"},
+        {4096,  3840, 16128, 128, 256, "wg384=320 -> 2 waves, no saving"},
+        {1024, 15360, 16128, 128, 256, "wg384=320 -> 2 waves, no saving"},
+        {2048,  6528, 16128, 128, 384, "N%256!=0, only non-truncating route"},
+        {2048,  7296, 16128, 128, 384, "N%256!=0, only non-truncating route"},
+        // N%256!=0 outside the perf arms' gates: the exact route is a correctness floor, so it
+        // must survive both large Kp (the 128x384 arm is K-gated) and a CU-filling grid (it is
+        // also wg256<CU-gated). All four used to fall through to 256x256 and drop 128 columns.
+        {  256,   384, 32768, 128, 384, "large Kp, wg128<CU: exact route is not K-gated"},
+        {  128,   384, 32768, 128, 384, "same, and 256x256 would launch a 0-wide grid"},
+        { 8192,  6528,  4096, 128, 384, "wg256=800>=CU: exact route is not CU-fill-gated"},
+        { 4096,  7296, 32768, 128, 384, "both gates missed at once"},
+        // M an odd multiple of 128 on a CU-filling grid: 256x256 would drop the last 128 rows.
+        {  896, 22272,  4096, 128, 256, "M%256!=0 falls back to a tile that divides M"},
+        {2048,  6144, 105728, 128, 128, "large-K wide-N keeps priority over 128x384"},
+        {2048,  1024,  16128, 128, 256, "narrow N"},
+        {2048,  4096,   4096, 128, 256, "N%384!=0"},
+        {2048, 16384,   1024, 256, 256, "wg256 >= CU"},
+        {2048, 20480,   6144, 256, 256, "wg256 >= CU"},
+        {4096,  4096,    768, 256, 256, "wg256 >= CU"},
+    };
+    // clang-format on
+    int bad = 0;
+    for (const Case& c : cases) {
+        TileChoice tc = choose_tile(c.M, c.N, kpad(c.K));
+        bool ok = tc.MT == c.MT && tc.NT == c.NT;
+        if (!ok) {
+            printf("  route %5dx%6dx%6d : got %3dx%3d want %3dx%3d  FAIL<<<  (%s)\n", c.M, c.N,
+                   c.K, tc.MT, tc.NT, c.MT, c.NT, c.why);
+            bad++;
+        }
+    }
+    printf("  choose_tile routing: %d/%d %s\n", (int)(sizeof(cases) / sizeof(*cases)) - bad,
+           (int)(sizeof(cases) / sizeof(*cases)), bad ? "FAIL<<<" : "OK");
+
+    // Invariant sweep: the grid is launched with integer division and there is no remainder
+    // handling, so choose_tile() must never hand back a tile that fails to divide M/N. The four
+    // implemented tiles cover every M%128==0, N%128==0 shape (128x128 is the floor), so the whole
+    // grid up to 16384x24576 must route without truncating, on both sides of the large-K
+    // threshold. A single miss here is silently wrong output.
+    static const int sweep_K[] = {512, 4096, 16128, 32768, 40000, 105728};
+    long div_bad = 0, div_tot = 0;
+    for (int M = 128; M <= 16384; M += 128)
+        for (int N = 128; N <= 24576; N += 128) {
+            for (int K : sweep_K) {
+                TileChoice tc = choose_tile(M, N, kpad(K));
+                div_tot++;
+                if (M % tc.MT == 0 && N % tc.NT == 0) continue;
+                if (div_bad < 5)
+                    printf("  divides %5dx%6dx%6d : %3dx%3d covers only %dx%d  FAIL<<<\n", M, N, K,
+                           tc.MT, tc.NT, (M / tc.MT) * tc.MT, (N / tc.NT) * tc.NT);
+                div_bad++;
+            }
+        }
+    printf("  tile divides M/N: %ld/%ld %s\n", div_tot - div_bad, div_tot,
+           div_bad ? "FAIL<<<" : "OK");
+
+    // The split path only implements 128x256/256x256, so a shape routed to any other tile must
+    // come back with no workspace. These three all split before the guard: the 2688/5760 pair
+    // faulted on the GPU, the 128x384 one returned garbage.
+    struct NoSplit {
+        int M, N, K;
+    };
+    static const NoSplit ns[] = {{128, 384, 3072}, {2048, 2688, 24576}, {2048, 5760, 16128}};
+    int sbad = 0;
+    for (const NoSplit& c : ns) {
+        int Kp = kpad(c.K);
+        TileChoice tc = choose_tile(c.M, c.N, Kp);
+        if ((tc.NT == 384 || tc.NT == 128) && gemm_workspace_size(c.M, c.N, Kp) != 0) {
+            printf("  split %5dx%6dx%6d : %dx%d must not split  FAIL<<<\n", c.M, c.N, c.K, tc.MT,
+                   tc.NT);
+            sbad++;
+        }
+    }
+    printf("  split-K tile guard: %d/%d %s\n", (int)(sizeof(ns) / sizeof(*ns)) - sbad,
+           (int)(sizeof(ns) / sizeof(*ns)), sbad ? "FAIL<<<" : "OK");
+    return bad == 0 && div_bad == 0 && sbad == 0;
+}
+
 static void perf(int M, int N, int K) {
     int Kp_est = ((K + K_TILE - 1) / K_TILE) * K_TILE;
     TileChoice tc = choose_tile(M, N, Kp_est);
@@ -239,13 +363,14 @@ static void perf(int M, int N, int K) {
     int base_wg = (M / tc.MT) * (N / tc.NT);
     int S = wsb ? (int)(wsb / ((size_t)M * N * sizeof(float))) : 1;  // S from workspace size
     int wg = base_wg * S;
-    printf("  %5dx%5dx%5d wg=%4d S=%d -> %3dx%3d : %.0f TFLOPs\n", M, N, K, wg, S, tc.MT, tc.NT,
-           tf(M, N, K, ms));
+    printf("  %5dx%6dx%6d wg=%5d S=%d -> %3dx%3d : %9.6f ms  %8.3f TFLOPs\n", M, N, K, wg, S,
+           tc.MT, tc.NT, ms, tf(M, N, K, ms));
     if (ws) hipFree(ws);
     hipFree(dD);
     teardown(x);
 }
 int main(int argc, char** argv) {
+    if (argc >= 2 && strcmp(argv[1], "--routing") == 0) return check_routing() ? 0 : 1;
     if (argc >= 4) {
         int M = atoi(argv[1]), N = atoi(argv[2]), K = atoi(argv[3]);
         perf(M, N, K);
@@ -253,6 +378,7 @@ int main(int argc, char** argv) {
     }
     printf("=== libmxfp6gemm correctness (end-to-end, CPU ref) ===\n");
     int f = 0;
+    f += !check_routing();
     f += !verify(512, 512, 768);    // -> 128x256 path (wg256<CU)
     f += !verify(768, 1280, 960);   // -> 128x256, non-square
     f += !verify(4096, 4096, 768);  // -> 256x256 path (wg256=256), small K for fast ref
@@ -269,6 +395,20 @@ int main(int argc, char** argv) {
     // 256x256x768: grid 2x2 WGs, k_tiles=4. 384x512x1536: grid 3x4 WGs, k_tiles=8.
     f += !verify_128x128(256, 256, 768);
     f += !verify_128x128(384, 512, 1536);
+    // 128x384 kernel path (WAVES_M=1, WAVES_N=4, MPW=4, NPW=3): small shapes, fast CPU ref.
+    // 256x384x768: grid 2x1 WGs, k_tiles=4. 384x768x960: grid 3x2 WGs, k_tiles=5.
+    f += !verify_128x384(256, 384, 768);
+    f += !verify_128x384(384, 768, 960);
+    // Routed (not forced) 128x384 on a WG-starved grid deep enough to tempt split-K: wg384=1,
+    // k_tiles=16. Before the splitk_S guard this ran a 128x256 kernel against NPW=3 scales and
+    // wrote only 256 of the 384 columns. Run twice: once as a normal caller, once handing over a
+    // workspace anyway, which is the call shape that triggered the corruption.
+    f += !verify(128, 384, 3072);
+    f += !verify(128, 384, 3072, /*force_ws=*/true);
+    // Routed 128x384 at Kp >= LARGEK_THRESH (kpad(32768)=32832). The 128x384 arm is gated on
+    // Kp < the threshold and the 128x128 arm on wg128 >= CU (here 6), so this used to fall
+    // through to 256x256 and write only columns 0..255 on a 1x1 grid.
+    f += !verify(256, 384, 32768);
     if (f) {
         printf("  CORRECTNESS FAILED\n");
         return 1;
@@ -278,8 +418,10 @@ int main(int argc, char** argv) {
     int sh[][3] = {{2048, 1024, 12288},   // tier-1: narrow N + large K
                    {2048, 1024, 16128},   // tier-1: narrow N + larger K
                    {2048, 1024, 105728},
-                   {2048, 6144, 16128},   // control: wide N, same K (128x256 path, Kp<32768)
-                   {2048, 6144, 105728}}; // wide N + large K: 128x128 candidate
+                   {2048, 6144, 512},     // wide N small K: 128x384 path
+                   {2048, 6144, 4096},    // wide N medium K: 128x384 path
+                   {2048, 6144, 16128},   // wide N larger K: 128x384 path
+                   {2048, 6144, 105728}}; // wide N + large K: 128x128 path
     for (auto& s : sh) perf(s[0], s[1], s[2]);
     return 0;
 }

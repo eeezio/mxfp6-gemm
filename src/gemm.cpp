@@ -25,9 +25,32 @@ TileChoice choose_tile(int M, int N, int Kp) {
         if (wg128 >= CU)
             return {128, 128, 2, 2};  // large-K wide-N: halve B working-set per WG
     }
+    // 128x384 path: 12 acc per wave, taken when it saves a whole CU wave over 128x256.
+    // Requires WAVES_M=1, WAVES_N=4 so N_PW=3 satisfies the scale static_assert (N_PW<=4).
+    // Compute per B-slot = 1152/9 = 128 cyc (vs 64 for 128x256), so PFD=5 covers 640 cyc.
+    // Only activates for moderate K (B-slice = 384*Kp*0.75; at LARGEK_THRESH=32768 this is
+    // 9.4MB, past L2 — so we gate Kp < LARGEK_THRESH and let 128x128 handle the rest).
+    if (wg256 < CU && (M % 128) == 0 && (N % 384) == 0 && Kp < LARGEK_THRESH) {
+        int wg384 = (M / 128) * (N / 384);
+        int wg256_grid = (M / 128) * (N / 256);
+        bool saves_a_wave =
+            wg384 >= CU && 3 * ((wg384 + CU - 1) / CU) < 2 * ((wg256_grid + CU - 1) / CU);
+        if (saves_a_wave)
+            return {128, 384, 4, 3};  // WAVES_M=1, WAVES_N=4, MPW=4, NPW=3
+    }
     if (wg256 < CU && (M % 128) == 0 && (N % 256) == 0)
         return {128, 256, 2, 4};  // WG-starved small-M: fill CUs
-    return {256, 256, 4, 4};      // workhorse: 16-acc sweet spot
+    // Correctness floor. Every arm above is a PERF choice, gated on CU fill and on Kp; a shape
+    // they all decline used to land on 256x256 unconditionally, and the grid is launched with
+    // integer division, so a 256 that does not divide M/N silently dropped the remainder (e.g.
+    // M=256 N=384 Kp=32832: 128x128 wants wg128>=CU, 128x384 is K-gated, 128x256 needs N%256==0
+    // -> 256x256 on a 1x1 grid, columns 256..383 never written). Pick the widest IMPLEMENTED
+    // tile that actually divides the shape, preferring the better-measured route on ties.
+    if ((M % 256) == 0 && (N % 256) == 0) return {256, 256, 4, 4};  // workhorse: 16-acc sweet spot
+    if ((M % 128) == 0 && (N % 256) == 0) return {128, 256, 2, 4};
+    if ((M % 128) == 0 && (N % 384) == 0) return {128, 384, 4, 3};  // only route when N%256!=0
+    if ((M % 128) == 0 && (N % 128) == 0) return {128, 128, 2, 2};
+    return {256, 256, 4, 4};  // no implemented tile covers this shape — caller must pad M/N
 }
 
 size_t gemm_workspace_size(int M, int N, int Kp) {
