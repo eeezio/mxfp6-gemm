@@ -95,10 +95,8 @@ session reproduces its 2026-07-29 numbers to within 1% (K=16128: 1669 vs 1654; K
 1463), which is the check that the two sessions are comparable.
 
 Both routes are auto-selected in `choose_tile`; shapes that meet neither condition are
-byte-for-byte unchanged. The 128×128 route was separately cross-checked on **MI355X**
-(`smci355-ccs-aus-n03-05`, ours + CK in one session) where K=105728 went 1318 → 1811 against CK 1523,
-i.e. 0.87× → 1.19×. Full per-track / per-machine data:
-[`prof_results/experiments-2026-07-16/EXPERIMENT-LOG.md`](prof_results/experiments-2026-07-16/EXPERIMENT-LOG.md).
+byte-for-byte unchanged. Raw:
+[`prof_results/bench_mi350x_k2-3a_2026-08-11.txt`](prof_results/bench_mi350x_k2-3a_2026-08-11.txt).
 
 > Cross-machine absolute TFLOPs are not comparable — only same-session ratios and deltas are. The
 > table above is one machine, one session. Earlier revisions of this section quoted a 128×256 →

@@ -17,10 +17,10 @@
 namespace mxfp6 {
 namespace detail {
 
-// Grid swizzle mode for lds_gemm_hybrid_dripA's SWZ parameter: XCD-aware workgroup remap.
-// Measured +4.6%/+3.8% on the 256x256 large-N shallow-K shapes and +3.2% on 128x384; the 128x128
-// route LOSES 3.5% (its wg_m A-slices are 10 MB at large K, so grouping by wg_n costs more A
-// locality than it buys in B) and the 128x256 route is unmeasured -- both stay unswizzled.
+// XCD-aware workgroup remap, for lds_gemm_hybrid_dripA's SWZ parameter. Measured +4.6%/+3.8% on
+// the 256x256 large-N shallow-K shapes and +3.2% on 128x384, but LOSES 3.5% on 128x128 (its
+// A-slices are 10 MB at large K, so grouping by wg_n costs more A locality than it buys in B).
+// 128x128 and the unmeasured 128x256 therefore stay unswizzled.
 constexpr int SWZ_XCD = -1;
 
 // Split factor S for (M,N,Kp): the number of K-segments to split across independent workgroups
@@ -41,10 +41,8 @@ inline int splitk_S(int M, int N, int Kp) {
     int k_tiles = (Kp / 64) / (KT / 64);    // total deep tiles for full K = Kp/192
     int base_wg = (M / tc.MT) * (N / tc.NT);
     int S = 1;
-    // base_wg == 0 when the shape is smaller than the tile it fell through to -- M<256 or N<256
-    // against 256x256. Dividing by it below is a host-side SIGFPE in a *query* function, so guard
-    // it here rather than at the call sites. Such a shape is outside the divisibility contract and
-    // its output is truncated either way; this only stops gemm_workspace_size() from crashing.
+    // base_wg == 0 when the shape is smaller than the tile it fell through to (M<256 or N<256
+    // against 256x256). Dividing by it is a SIGFPE in what is a host-side *query* function.
     if (base_wg > 0 && base_wg < CU && k_tiles >= 2 * MIN_TILES_PER_SEG) {
         S = (CU + base_wg - 1) / base_wg;             // ceil(CU/base_wg): min segments to fill CUs
         int s_cap = k_tiles / MIN_TILES_PER_SEG;      // each segment not shorter than the floor
@@ -155,11 +153,10 @@ inline void dispatch_gemm_kge(int M, int N, int Kp, const void* dA, const void* 
                                   0, k_tiles, nullptr);
         }
     } else if (N % 256 != 0) {
-        // 256x256 over a CEIL grid: the last N-tile hangs off the end of the matrix and its
-        // out-of-range columns are dropped at the store (NMASK). Taken for N%128==0, N%256!=0,
-        // where the only tile that divides N is 128x128 -- and a 4-acc tile amortizes the
-        // shallow-K fixed cost over a quarter of the work, which costs far more than wasting
-        // half of one N-tile out of ceil(N/256).
+        // NMASK: 256x256 over a ceil(N/256) grid, last N-tile masked at the store. For N%128==0,
+        // N%256!=0, where the only tile that divides N is 128x128 -- and a 4-acc tile amortizes
+        // the shallow-K fixed cost over a quarter of the work, which costs far more than wasting
+        // half of one N-tile (measured 1274 vs 1455 TFLOPs on 2048x102272x1024).
         dim3 g(M / 256, (N + 255) / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
         lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, 5, true, 1, 1, 1,
@@ -175,9 +172,8 @@ inline void dispatch_gemm_kge(int M, int N, int Kp, const void* dA, const void* 
     }
 }
 
-// k_tiles_seg < 2 only happens at Kp == K_TILE (splitk_S floors every segment at 8 tiles), so the
-// KGE2 arm covers every other shape and lets the compiler drop the loop guard -- which is what
-// stops it emitting the accumulator zero-init twice.
+// k_tiles_seg < 2 only happens at Kp == K_TILE, so the KGE2 arm covers every other shape and lets
+// the compiler drop the loop guard -- which is what stops it emitting the acc zero-init twice.
 template <typename OutT>
 inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh,
                           const uint8_t* dsA, const uint8_t* dsB, OutT* dD, int A_row_bytes,
@@ -219,12 +215,7 @@ inline void dispatch_gemm_force_tile_kge(int M, int N, int Kp, TileChoice tc, co
             <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
                               0, k_tiles, nullptr);
     } else if (N % 256 != 0) {
-        // 256x256 over a CEIL grid: the last N-tile hangs off the end of the matrix and its
-        // out-of-range columns are dropped at the store (NMASK). Taken for N%128==0, N%256!=0,
-        // where the only tile that divides N is 128x128 -- and a 4-acc tile amortizes the
-        // shallow-K fixed cost over a quarter of the work, which costs far more than wasting
-        // half of one N-tile out of ceil(N/256).
-        dim3 g(M / 256, (N + 255) / 256);
+        dim3 g(M / 256, (N + 255) / 256);  // NMASK, as in dispatch_gemm_kge above
         int lds = 2 * (256 * (KT * 6 / 8));
         lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, 5, true, 1, 1, 1,
                               0, true>

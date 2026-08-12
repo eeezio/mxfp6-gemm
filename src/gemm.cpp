@@ -14,8 +14,7 @@ TileChoice choose_tile(int M, int N, int Kp) {
     int wg256 = (M / 256) * (N / 256);
     // 128x128 path: the large-K wide-N shapes 128x384 cannot take. It beats 128x256 by dropping
     // the half-empty second CU wave, NOT by fitting B in L2 (a 128-col B/N-slice is 10.16 MB
-    // against a 4 MB L2). Guard: shape must be 128x128-grid-valid AND Kp known AND large enough.
-    // Threshold: Kp >= 32768, chosen to activate at the 105728-padded shapes at N=6144.
+    // against a 4 MB L2). Threshold chosen to activate at the 105728-padded shapes at N=6144.
     constexpr int LARGEK_THRESH = 32768;
     // 128x384 path: 12 acc per wave, taken when it saves a whole CU wave over 128x256.
     // Requires WAVES_M=1, WAVES_N=4 so N_PW=3 satisfies the scale static_assert (N_PW<=4).
@@ -28,10 +27,9 @@ TileChoice choose_tile(int M, int N, int Kp) {
         saves_a_wave =
             wg384 >= CU && 3 * ((wg384 + CU - 1) / CU) < 2 * ((wg256_grid + CU - 1) / CU);
     }
-    // Wave-saving 128x384 is NOT K-gated: it beats 128x128 by 35-41% at large K (measured
-    // 2026-08-05, M=2048 N=6144, K=32768..105728). The B/N-slice does grow, but A is re-read
-    // N/NT times, so the wider tile moves 1.5x fewer bytes overall — at large K this shape is
-    // bandwidth-bound and total traffic, not B's L2 residency, is what decides.
+    // Deliberately NOT K-gated: measured 35-41% faster than 128x128 at K=32768..105728 (2026-08-05,
+    // M=2048 N=6144). A is re-read N/NT times, so the wider tile moves 1.5x fewer bytes overall
+    // even though its B/N-slice grows past L2.
     if (saves_a_wave)
         return {128, 384, 4, 3};  // WAVES_M=1, WAVES_N=4, MPW=4, NPW=3
     if (wg256 < CU && (M % 128) == 0 && (N % 128) == 0 && Kp >= LARGEK_THRESH) {
@@ -43,25 +41,18 @@ TileChoice choose_tile(int M, int N, int Kp) {
     }
     if (wg256 < CU && (M % 128) == 0 && (N % 256) == 0)
         return {128, 256, 2, 4};  // WG-starved small-M: fill CUs
-    // Correctness floor. Every arm above is a PERF choice, gated on CU fill and on Kp; a shape
-    // they all decline used to land on 256x256 unconditionally, and the grid is launched with
-    // integer division, so a 256 that does not divide M/N silently dropped the remainder (e.g.
-    // M=256 N=384 Kp=32832: the wave-saving arm wants wg384>=CU and 128x128 wants wg128>=CU (both
-    // are 2 and 6 here), and 128x256 needs N%256==0 -> 256x256 on a 1x1 grid, columns 256..383
-    // never written). Pick the widest IMPLEMENTED tile that actually divides the shape,
-    // preferring the better-measured route on ties. This also subsumes the old K-gated
-    // "only_exact_route" arm: an N%256!=0 shape below LARGEK_THRESH reaches the 128x384 line here
-    // and gets the same tile, so keeping a separate arm for it would only be a slower way to
-    // spell the same answer.
+    // Coverage floor. Every arm above is a PERF choice gated on CU fill, and a shape they all
+    // decline used to land on 256x256 unconditionally -- with an integer-division grid, so a 256
+    // that does not divide N silently dropped the remainder (M=256 N=384: 1x1 grid, columns
+    // 256..383 never written). Pick the widest IMPLEMENTED tile that reaches the whole shape,
+    // preferring the better-measured route on ties.
     if ((M % 256) == 0 && (N % 256) == 0) return {256, 256, 4, 4};  // workhorse: 16-acc sweet spot
     if ((M % 128) == 0 && (N % 256) == 0) return {128, 256, 2, 4};
     if ((M % 128) == 0 && (N % 384) == 0) return {128, 384, 4, 3};  // only route when N%256!=0
-    // N%128==0 but no tile of N_TILE>=256 divides it. 128x128 does, but a 4-acc tile amortizes
-    // shallow-K fixed cost over a quarter of the work: 2048x102272x1024 measures 1274 TFLOPs there
-    // against 1455 for 256x256. So run 256x256 over a ceil(N/256) grid instead and mask the last
-    // N-tile's out-of-range columns at the store (dispatch picks the NMASK kernel off N%256!=0).
-    // Needs (N/32)%NPW == 0 for the scale grouping to still cover every real block, which for
-    // NPW=4 is exactly N%128==0. M must divide 256: there is no M-remainder handling.
+    // N%128==0 with no 256-wide divisor. 128x128 divides it, but a 4-acc tile amortizes shallow-K
+    // fixed cost over a quarter of the work: 1274 TFLOPs against 1455 on 2048x102272x1024. So run
+    // 256x256 over a ceil(N/256) grid and mask the last N-tile at the store instead. Needs
+    // (N/32)%NPW == 0, which for NPW=4 is exactly N%128==0; M must divide 256 (no M-remainder).
     if ((M % 256) == 0 && (N % 128) == 0) return {256, 256, 4, 4};
     if ((M % 128) == 0 && (N % 128) == 0) return {128, 128, 2, 2};
     return {256, 256, 4, 4};  // no implemented tile covers this shape — caller must pad M/N

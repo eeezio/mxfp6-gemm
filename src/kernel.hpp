@@ -88,13 +88,10 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     constexpr int NB = K64_PER_TILE * N_PW;                      // 12 b-stream positions / tile
     constexpr int ISSUES_A = (M_TILE * ROW_CHUNKS + 255) / 256;  // 9 A loads / tile
 
-    // The drip schedule hangs A's loads off the MFMA quartets, so the quartet count is a hard
-    // budget: a tile needs ISSUES_A chunks and only gets ADRIP_PER per issuing quartet. Run out
-    // and the trailing chunks are never issued at all -- the loop below just clamps a0/a1 to
-    // ISSUES_A and moves on, so the tail of the A tile stays whatever the previous tile left in
-    // LDS. That is silent wrong output, not a fault, and it is invisible in the ISA unless you
-    // count buffer_load_lds against M_TILE. Wide-M/narrow-N tiles are where it bites: 256x128 has
-    // ISSUES_A=9 but only NB-1=5 issuing quartets, so it needs ADRIP_PER=2.
+    // A's loads hang off the MFMA quartets, so the quartet count is a hard budget. Under-budget is
+    // SILENT: the loop clamps, and the tail of the A tile keeps whatever the previous tile left in
+    // LDS -- wrong output, no fault, invisible in the ISA unless you count buffer_load_lds against
+    // M_TILE. (256x128 would need ADRIP_PER=2: ISSUES_A=9 against 5 issuing quartets.)
     constexpr int ADRIP_STOP_EFF = (ADRIP_STOP > 0 && ADRIP_STOP <= NB) ? ADRIP_STOP : NB;
     constexpr int ADRIP_QUARTETS =
         ADRIP_STOP_EFF > ADRIP_START
@@ -109,12 +106,10 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     int wm = wave / WAVES_N, wn = wave % WAVES_N;
     int wg_m, wg_n;
     if constexpr (SWZ < 0) {
-        // XCD-aware remap (SWZ_XCD). The hardware hands workgroup pid to XCD pid%NXCC, so
-        // consecutive pids land on DIFFERENT XCDs and the 32 workgroups resident on one XCD end up
-        // holding 32 distinct wg_n -> B's 8x reuse across XCDs is never realised. Handing each XCD
-        // a contiguous run of linear tile ids instead drops that to ~5 distinct wg_n, so its
-        // resident workgroups share B slices. Bijective for any grid: the first `rem` XCDs take
-        // one extra tile. A non-bijective formula would silently drop output tiles.
+        // XCD-aware remap (SWZ_XCD). Hardware assigns pid to XCD pid%NXCC, so the 32 workgroups
+        // resident on one XCD hold 32 distinct wg_n and B's reuse across them is never realised.
+        // Giving each XCD a contiguous run of tile ids drops that to ~5. Must stay bijective (the
+        // first `rem` XCDs take one extra tile) -- a non-bijective formula drops output tiles.
         static_assert(!SPLITK, "XCD remap assumes a 2D grid");
         constexpr int NXCC = 8;
         int mb = gridDim.x, total = mb * (int)gridDim.y;
@@ -146,15 +141,11 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     constexpr int NDA = SA_PAD / 4, NDB = SB_PAD / 4;
     static_assert(NDA == 1 && NDB == 1, "tiled-scale path assumes <=4 blocks/wave");
     int sa_grp = wg_m * WAVES_M + wm, sb_grp = wg_n * WAVES_N + wn;
-    // NMASK: N is not a multiple of N_TILE, so the grid is ceil(N/N_TILE) and the LAST N-tile is
-    // only partly inside the matrix. Its out-of-range columns are dropped at the store (below);
-    // the work is still done, it just goes nowhere. What must not happen is the READ side running
-    // off the end of B or of B's scales -- those buffers are sized to the true N, so an
-    // out-of-range block would fault or read a neighbouring allocation. Clamp both indices to the
-    // last valid entry: the operands are then wrong for the masked columns, which is fine because
-    // their accumulators are never stored, and clamping is branch-free (a predicated load would
-    // sit in the MFMA-feeding path). Requires (N/32) % N_PW == 0 so the scale grouping still
-    // covers every real block -- dispatch only takes this path when it does.
+    // NMASK: ceil(N/N_TILE) grid, so the last N-tile is only partly inside the matrix. The store
+    // drops its out-of-range columns (below); these two clamps keep the READ side inside B and
+    // B's scales, which are sized to the true N. The clamped operands are wrong for the masked
+    // columns and that is fine -- their accumulators are never stored. Requires (N/32)%N_PW == 0
+    // so the scale grouping still covers every real block; dispatch only takes this path when so.
     int b_blk_max = 0, sb_grp_max = 0;
     if constexpr (NMASK) {
         b_blk_max = N / 32 - 1;
