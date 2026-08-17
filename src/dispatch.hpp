@@ -68,6 +68,23 @@ inline size_t splitk_workspace_bytes(int M, int N, int Kp) {
     return S > 1 ? (size_t)S * (size_t)M * N * sizeof(float) : 0;
 }
 
+// 64-K sub-slabs of the LAST k-tile that still carry real data, given the caller's unpadded K.
+// The rest of that tile is pure padding and the kernel skips it -- both its MFMA and its B loads.
+//
+// Rounds UP: a sub-slab that is only PARTLY real must still run in full, because MFMA consumes
+// K=64 atomically. Its padding half contributes 0 anyway (B's K-tail is zero, and pad_scales_k
+// keeps the scale tail non-NaN), so over-running is free-but-wasteful while under-running drops
+// real work. That asymmetry is why this rounds up, and why K_real needs no divisibility guard.
+//
+// Returns 0 for "no short tail, run the whole last tile". Two cases collapse to it: K_real not
+// supplied, and a last tile that is entirely real -- peeling that one would pay a barrier and a
+// scale re-read for zero saving, so it must not reach the kernel as TAIL_SUBS == K_TILE/64.
+inline int tail_subs_for(int K_real) {
+    if (K_real <= 0) return 0;
+    const int run = (K_real % K_TILE + 63) / 64;
+    return run == K_TILE / 64 ? 0 : run;
+}
+
 // Kp = K padded to a multiple of K_TILE(=192). Caller must have tiled the scales with
 // choose_tile(...).MPW/NPW and preshuffled B (preshuffle_B).
 // ws/ws_bytes: caller-provided split-K workspace (see gemm_workspace_size). If a WG-starved shape
@@ -77,9 +94,7 @@ template <typename OutT, bool KGE2>
 inline void dispatch_gemm_kge(int M, int N, int Kp, const void* dA, const void* dBsh,
                               const uint8_t* dsA, const uint8_t* dsB, OutT* dD, int A_row_bytes,
                               int B_row_bytes, void* ws, size_t ws_bytes, int K_real = 0) {
-    // Sub-slabs of the last tile that are entirely K-padding. Only meaningful when K_real lands on
-    // a 64-K boundary; a partial sub-slab still has real data in it and must be computed.
-    const int tail_subs = (K_real > 0 && K_real % 64 == 0) ? (K_real / 64) % (K_TILE / 64) : 0;
+    const int tail_subs = tail_subs_for(K_real);
     constexpr int KT = K_TILE;
     dim3 blk(256);
     int kit = Kp / 64;
@@ -246,7 +261,7 @@ template <typename OutT, bool KGE2>
 inline void dispatch_gemm_force_tile_kge(int M, int N, int Kp, TileChoice tc, const void* dA,
                                          const void* dBsh, const uint8_t* dsA, const uint8_t* dsB,
                                          OutT* dD, int A_row_bytes, int B_row_bytes, int K_real = 0) {
-    const int tail_subs = (K_real > 0 && K_real % 64 == 0) ? (K_real / 64) % (K_TILE / 64) : 0;
+    const int tail_subs = tail_subs_for(K_real);
     constexpr int KT = K_TILE;
     dim3 blk(256);
     int kit = Kp / 64;

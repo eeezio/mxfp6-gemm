@@ -438,6 +438,21 @@ int main(int argc, char** argv) {
     // Two padding sub-slabs instead of one ((K/64)%3 == 2), again both parities.
     f += !verify_256x256_tail(256, 256, 320);   // Kp=384,  2 k-tiles -> short tile in buffer 1
     f += !verify_256x256_tail(256, 512, 512);   // Kp=576,  3 k-tiles -> short tile in buffer 0
+    // K % 64 == 32: the last real sub-slab is only HALF real, which the old `K_real % 64 == 0`
+    // guard refused to touch at all. Grouped by what a floor rounding (instead of ceil) does to
+    // them -- measured with floor patched in, not assumed. r = K % K_TILE.
+    //   r == 32: floor gives 0, which merely DISABLES the tail. Correct either way, so these two
+    //   are coverage of the r=32 -> tail=1 mapping; they do not discriminate the rounding.
+    f += !verify_256x256_tail(256, 256, 992);   // Kp=1152, 6 k-tiles, tail 1 -> buffer 1
+    f += !verify_256x256_tail(256, 512, 800);   // Kp= 960, 5 k-tiles, tail 1 -> buffer 0
+    //   r == 96: floor runs 1 sub-slab where 2 are real, so these DO fail under floor.
+    f += !verify_256x256_tail(256, 256, 1056);  // Kp=1152, 6 k-tiles, tail 2 -> buffer 1
+    f += !verify_256x256_tail(256, 512, 864);   // Kp= 960, 5 k-tiles, tail 2 -> buffer 0
+    //   r == 160: the whole last tile is real, so tail_subs_for() normalizes 3 down to 0 and this
+    //   runs the plain kernel. Also fails under floor (2 where 3 are real). It does NOT cover the
+    //   normalize itself -- an un-normalized 3 reaches the same plain kernel, since dispatch wires
+    //   no TAIL_SUBS == 3 branch.
+    f += !verify_256x256_tail(256, 256, 1120);  // Kp=1152, nothing to skip
     // pad-B-only / compact-A recipe. K = multiple of 32 (MX block) but NOT of K_TILE, so a real
     // K-tail exists (exercises the inter-row overlap + end pad + NaN-safe scale tail):
     f += !verify_compact(4096, 4096, 224);  // -> 256x256, 2 k_tiles
