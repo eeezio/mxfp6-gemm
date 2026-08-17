@@ -35,8 +35,9 @@ inline int kpad(int K) {
 // Tile chosen for (M,N,Kp). MPW/NPW = per-wave 32-block counts (2x2 waves); the host scale
 // tiling (tile_scale) MUST use these for A and B respectively.
 // Kp is REQUIRED (no default) and must be the same padded Kp (= kpad(K)) you pass to gemm():
-// tile selection is K-aware — large-K wide-N shapes route to the 128x128 tile, which uses a
-// different MPW/NPW than the 128x256 tile. Preprocessing the scales with a different Kp than
+// tile selection is K-aware in exactly one arm — a large-K wide-N shape that the (un-K-gated)
+// 128x384 route declines falls back to the 128x128 tile, whose (MPW,NPW) differs from whichever
+// tile the same shape takes at smaller Kp. Preprocessing the scales with a different Kp than
 // gemm() sees would tile them for the wrong kernel and silently corrupt the output, so the
 // Kp-consistency is enforced at compile time (there is intentionally no M/N-only overload).
 struct TileChoice {
