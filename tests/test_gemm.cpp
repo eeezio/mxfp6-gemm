@@ -272,16 +272,25 @@ static bool check_routing() {
         {1024, 15360, 16128, 128, 256, "wg384=320 -> 2 waves, no saving"},
         {2048,  6528, 16128, 128, 384, "N%256!=0, only non-truncating route"},
         {2048,  7296, 16128, 128, 384, "N%256!=0, only non-truncating route"},
-        // N%256!=0 outside the perf arms' gates: the exact route is a correctness floor, so it
-        // must survive both large Kp (the 128x384 arm is K-gated) and a CU-filling grid (it is
-        // also wg256<CU-gated). All four used to fall through to 256x256 and drop 128 columns.
-        {  256,   384, 32768, 128, 384, "large Kp, wg128<CU: exact route is not K-gated"},
+        // N%256!=0 outside every perf arm's gate: the divisibility floor has to catch these, since
+        // the wave-saving arm needs wg384>=CU, the 128x128 arm needs wg128>=CU, and neither is
+        // reachable here. All four used to fall through to 256x256 and drop 128 columns.
+        {  256,   384, 32768, 128, 384, "wg384=2, wg128=6: only the floor covers N"},
         {  128,   384, 32768, 128, 384, "same, and 256x256 would launch a 0-wide grid"},
-        { 8192,  6528,  4096, 128, 384, "wg256=800>=CU: exact route is not CU-fill-gated"},
-        { 4096,  7296, 32768, 128, 384, "both gates missed at once"},
+        { 8192,  6528,  4096, 128, 384, "wg256=800>=CU, so wide384 is false: floor covers N"},
+        { 4096,  7296, 32768, 128, 384, "CU-filling and large K at once"},
         // M an odd multiple of 128 on a CU-filling grid: 256x256 would drop the last 128 rows.
         {  896, 22272,  4096, 128, 256, "M%256!=0 falls back to a tile that divides M"},
-        {2048,  6144, 105728, 128, 128, "large-K wide-N keeps priority over 128x384"},
+        // N%128==0 with no 256-wide divisor: 256x256 over a ceil grid beats the 128x128 that
+        // divides (measured 1435 vs 1273 TFLOPs on the first of these).
+        {2048,102272,  1024, 256, 256, "partial last N-tile beats the 4-acc tile that divides"},
+        {2048,  1408,  4096, 256, 256, "same, small N"},
+        {2048, 12672,  1024, 128, 384, "N%384==0 keeps the exact route over the masked one"},
+        { 896,  1408,  4096, 128, 128, "M%256!=0 cannot mask N: needs a tile that divides both"},
+        {2048,  6144, 105728, 128, 384, "wave-saving 128x384 is not K-gated (measured +44%)"},
+        { 512, 24576, 105728, 128, 384, "same wg384=256 family, large K"},
+        {2048,  4096, 105728, 128, 128, "large-K wide-N, N%384!=0 -> 128x128"},
+        {2048,  2688, 105728, 128, 128, "N%256!=0 but wg384<CU: 128x128 wins before the floor"},
         {2048,  1024,  16128, 128, 256, "narrow N"},
         {2048,  4096,   4096, 128, 256, "N%384!=0"},
         {2048, 16384,   1024, 256, 256, "wg256 >= CU"},
@@ -302,11 +311,11 @@ static bool check_routing() {
     printf("  choose_tile routing: %d/%d %s\n", (int)(sizeof(cases) / sizeof(*cases)) - bad,
            (int)(sizeof(cases) / sizeof(*cases)), bad ? "FAIL<<<" : "OK");
 
-    // Invariant sweep: the grid is launched with integer division and there is no remainder
-    // handling, so choose_tile() must never hand back a tile that fails to divide M/N. The four
-    // implemented tiles cover every M%128==0, N%128==0 shape (128x128 is the floor), so the whole
-    // grid up to 16384x24576 must route without truncating, on both sides of the large-K
-    // threshold. A single miss here is silently wrong output.
+    // Coverage sweep: the launched grid must reach every output element. M is always by division
+    // (there is no M-remainder handling), N either by division or via the 256-wide tile's ceil
+    // grid + store mask. Anything else silently drops rows/columns. The four tiles plus that mask
+    // cover every M%128==0, N%128==0 shape, so the whole grid up to 16384x24576 must route
+    // cleanly, on both sides of the large-K threshold.
     static const int sweep_K[] = {512, 4096, 16128, 32768, 40000, 105728};
     long div_bad = 0, div_tot = 0;
     for (int M = 128; M <= 16384; M += 128)
@@ -314,14 +323,15 @@ static bool check_routing() {
             for (int K : sweep_K) {
                 TileChoice tc = choose_tile(M, N, kpad(K));
                 div_tot++;
-                if (M % tc.MT == 0 && N % tc.NT == 0) continue;
+                bool n_ok = N % tc.NT == 0 || (tc.NT == 256 && N % 128 == 0);
+                if (M % tc.MT == 0 && n_ok) continue;
                 if (div_bad < 5)
-                    printf("  divides %5dx%6dx%6d : %3dx%3d covers only %dx%d  FAIL<<<\n", M, N, K,
+                    printf("  covers %5dx%6dx%6d : %3dx%3d reaches only %dx%d  FAIL<<<\n", M, N, K,
                            tc.MT, tc.NT, (M / tc.MT) * tc.MT, (N / tc.NT) * tc.NT);
                 div_bad++;
             }
         }
-    printf("  tile divides M/N: %ld/%ld %s\n", div_tot - div_bad, div_tot,
+    printf("  tile covers M/N: %ld/%ld %s\n", div_tot - div_bad, div_tot,
            div_bad ? "FAIL<<<" : "OK");
 
     // The split path only implements 128x256/256x256, so a shape routed to any other tile must
@@ -343,6 +353,16 @@ static bool check_routing() {
     }
     printf("  split-K tile guard: %d/%d %s\n", (int)(sizeof(ns) / sizeof(*ns)) - sbad,
            (int)(sizeof(ns) / sizeof(*ns)), sbad ? "FAIL<<<" : "OK");
+
+    // Shapes smaller than the tile they fall through to: (M/tc.MT)*(N/tc.NT) == 0, which splitk_S
+    // used to divide by. The divisibility floor covers everything that is a multiple of 128, so
+    // reaching zero now takes an M or N that no tile divides -- 192 and 64 below. Their output is
+    // truncated regardless, but a query has no business killing the process. Nothing to assert
+    // beyond "it returns": an unguarded build dies here with SIGFPE and takes the suite with it.
+    static const NoSplit deg[] = {{192, 256, 32832}, {256, 192, 3072}, {64, 64, 3072}};
+    for (const NoSplit& c : deg) (void)gemm_workspace_size(c.M, c.N, kpad(c.K));
+    printf("  workspace query on sub-tile shapes: %d/%d OK (no SIGFPE)\n",
+           (int)(sizeof(deg) / sizeof(*deg)), (int)(sizeof(deg) / sizeof(*deg)));
     return bad == 0 && div_bad == 0 && sbad == 0;
 }
 
@@ -399,6 +419,12 @@ int main(int argc, char** argv) {
     // 256x384x768: grid 2x1 WGs, k_tiles=4. 384x768x960: grid 3x2 WGs, k_tiles=5.
     f += !verify_128x384(256, 384, 768);
     f += !verify_128x384(384, 768, 960);
+    // Same path, but a grid of 10x3 = 30 workgroups. The 128x384 route is XCD-swizzled, and the
+    // remap only has to distribute a remainder when the grid exceeds NXCC=8: below that,
+    // per=0/rem=total collapses it to the identity, which is what the two shapes above hit. At 30
+    // it is per=3, rem=6, so both arms of the bijection run. A remainder bug there does not fault
+    // -- it leaves an output tile claimed by no workgroup, which only a value check catches.
+    f += !verify_128x384(1280, 1152, 384);
     // Routed (not forced) 128x384 on a WG-starved grid deep enough to tempt split-K: wg384=1,
     // k_tiles=16. Before the splitk_S guard this ran a 128x256 kernel against NPW=3 scales and
     // wrote only 256 of the 384 columns. Run twice: once as a normal caller, once handing over a
@@ -409,6 +435,11 @@ int main(int argc, char** argv) {
     // Kp < the threshold and the 128x128 arm on wg128 >= CU (here 6), so this used to fall
     // through to 256x256 and write only columns 0..255 on a 1x1 grid.
     f += !verify(256, 384, 32768);
+    // Routed 256x256 over a ceil(N/256) grid: N=640 is 2.5 N-tiles, so the last one is half
+    // outside the matrix. Checks the store mask AND that the clamped B / B-scale reads on that
+    // tile stay in bounds -- an unclamped build faults or reads a neighbouring allocation.
+    f += !verify(512, 640, 960);
+    f += !verify(256, 1408, 384);
     if (f) {
         printf("  CORRECTNESS FAILED\n");
         return 1;

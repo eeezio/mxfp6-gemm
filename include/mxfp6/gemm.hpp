@@ -4,11 +4,13 @@
 // One kernel paradigm (hybrid drip-A: A staged deep-K in LDS double-buffered + B streamed
 // coalesced HBM->VGPR ring + dripped A loads + RDB barrier + tiled-scale), shape-routed:
 //   * 256x256 tile (16-acc) for shapes whose grid fills the machine (WG >= #CU)
-//   * 128x384 tile (12-acc) for moderate-K wide-N shapes where N%384==0 and the grid exactly fills CUs
+//   * 128x384 tile (12-acc) for wide-N shapes where N%384==0 and the grid exactly fills CUs
 //   * 128x256 tile (8-acc)  for WG-starved small-M shapes (fills idle CUs)
-//   * 128x128 tile (4-acc)  for large-K wide-N shapes (shrinks B working set to fit L2)
-// Those four are PERF choices; under them divisibility is a hard floor, so choose_tile() never
-// returns a tile that fails to divide M/N as long as M and N are multiples of 128.
+//   * 128x128 tile (4-acc)  for the large-K wide-N shapes 128x384 cannot take
+// Those four are PERF choices; under them coverage is a hard floor, so for any M and N that are
+// multiples of 128 choose_tile() returns a tile that reaches the whole shape — M always by
+// division, N by division or, with no 256-wide divisor, by a ceil(N/256) grid whose last N-tile
+// is masked at the store.
 //
 // This header is device-free (plain declarations) — a host translation unit can include it
 // and link libmxfp6gemm without a HIP compiler. Inputs are pre-quantized DEVICE buffers:
@@ -33,8 +35,9 @@ inline int kpad(int K) {
 // Tile chosen for (M,N,Kp). MPW/NPW = per-wave 32-block counts (2x2 waves); the host scale
 // tiling (tile_scale) MUST use these for A and B respectively.
 // Kp is REQUIRED (no default) and must be the same padded Kp (= kpad(K)) you pass to gemm():
-// tile selection is K-aware — large-K wide-N shapes route to the 128x128 tile, which uses a
-// different MPW/NPW than the 128x256 tile. Preprocessing the scales with a different Kp than
+// tile selection is K-aware in exactly one arm — a large-K wide-N shape that the (un-K-gated)
+// 128x384 route declines falls back to the 128x128 tile, whose (MPW,NPW) differs from whichever
+// tile the same shape takes at smaller Kp. Preprocessing the scales with a different Kp than
 // gemm() sees would tile them for the wrong kernel and silently corrupt the output, so the
 // Kp-consistency is enforced at compile time (there is intentionally no M/N-only overload).
 struct TileChoice {
