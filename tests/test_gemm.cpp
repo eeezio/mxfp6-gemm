@@ -313,6 +313,11 @@ static bool check_routing() {
         // divides (measured 1435 vs 1273 TFLOPs on the first of these).
         {2048,102272,  1024, 256, 256, "partial last N-tile beats the 4-acc tile that divides"},
         {2048,  1408,  4096, 256, 256, "same, small N"},
+        // N=128 is the one N where the masked tile has no full N-tile to amortize it: 100% waste,
+        // measured 0.49x. It must take the 128x128 that divides instead.
+        {2048,   128,  1024, 128, 128, "N<256: masked 256x256 would compute 2x the columns"},
+        {2048,   128,  1840, 128, 128, "same, deeper K"},
+        { 256,   128,  1024, 128, 128, "same at the smallest M%256==0"},
         {2048, 12672,  1024, 128, 384, "N%384==0 keeps the exact route over the masked one"},
         { 896,  1408,  4096, 128, 128, "M%256!=0 cannot mask N: needs a tile that divides both"},
         {2048,  6144, 105728, 128, 384, "wave-saving 128x384 is not K-gated (measured +44%)"},
