@@ -379,3 +379,15 @@ proportionally more than the wave-quantization argument alone predicts.
    256 CUs (1.5 waves). Routing `N%384==0` shapes to a **128×384 tile** gives exactly 256 WGs;
    +29%/+49%/+59% and 1.64–2.04× CK. The gate was later found to apply at large K too (item 5), so
    every N=6144 shape now takes this route.
+8. **`2048×6144×512` is the one open regression risk on this branch.** The 50-shape A/B reports it
+   as overlapping rather than a loss, but the margin is **0.22%**: `main` spans 0.015986–0.017128 ms
+   and this branch 0.017090–0.019114, so the ranges touch by 38 ns. Best-against-best is **0.935×**,
+   and over 12 runs the median is 0.92× with 3 runs beating `main`'s best and 9 clearly behind.
+   Calling it noise is a verdict the disjointness test barely licensed, not one the data supports.
+   Both arms route 128×384, one of the two routes carrying the XCD swizzle. Diagnosing it needs an
+   ATT capture, since the bimodality is the whole signal. **Not started.**
+9. **`N=1` faults on this branch** where `main` launched a zero-width grid and returned without
+   computing. `N=1` is outside the contract (`preprocess.hpp` requires `N%32==0`) so neither is
+   correct, but a GPU coredump is a worse failure mode than a silent no-op. A cheap fix is an early
+   return with a stderr warning for `N%32!=0`, matching what `gemm()` already does when the split-K
+   workspace is too small. **Not started, deliberately deferred.**
