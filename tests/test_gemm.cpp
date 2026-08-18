@@ -228,9 +228,8 @@ static bool verify_128x128(int M, int N, int K) {
 }
 
 // Correctness check for the 256x256 SHORT-TAIL path on SMALL shapes. The routed short tail only
-// fires at N >= BRING8_MIN_N (105728-class), which no CPU reference can check, so force the tile
-// and hand it the true K. Pick K with (K/64)%3 == 1 to make the last of the k-tiles carry one real
-// 64-K sub-slab and two of pure padding. M and N must be multiples of 256.
+// fires at N >= BRING8_MIN_N, which no CPU reference can check, so force the tile and hand it the
+// true K. M and N must be multiples of 256.
 static bool verify_256x256_tail(int M, int N, int K) {
     constexpr TileChoice tc = {256, 256, 4, 4};
     Dev x = setup(M, N, K, tc);
@@ -435,29 +434,21 @@ int main(int argc, char** argv) {
     f += !verify(512, 512, 768);    // -> 128x256 path (wg256<CU)
     f += !verify(768, 1280, 960);   // -> 128x256, non-square
     f += !verify(4096, 4096, 768);  // -> 256x256 path (wg256=256), small K for fast ref
-    // Short-tail path (TAIL_SUBS): the last k-tile is 1 real 64-K sub-slab + 2 of pure padding.
-    // Both buffer parities matter -- the tile count decides whether the short tile lands in the
-    // first or the second LDS buffer, and an early version of the peel got one of them wrong.
-    f += !verify_256x256_tail(256, 256, 1024);  // Kp=1152, 6 k-tiles -> short tile in buffer 1
-    f += !verify_256x256_tail(256, 512, 1600);  // Kp=1728, 9 k-tiles -> short tile in buffer 0
-    // Two padding sub-slabs instead of one ((K/64)%3 == 2), again both parities.
-    f += !verify_256x256_tail(256, 256, 320);   // Kp=384,  2 k-tiles -> short tile in buffer 1
-    f += !verify_256x256_tail(256, 512, 512);   // Kp=576,  3 k-tiles -> short tile in buffer 0
-    // K % 64 == 32: the last real sub-slab is only HALF real, which the old `K_real % 64 == 0`
-    // guard refused to touch at all. Grouped by what a floor rounding (instead of ceil) does to
-    // them -- measured with floor patched in, not assumed. r = K % K_TILE.
-    //   r == 32: floor gives 0, which merely DISABLES the tail. Correct either way, so these two
-    //   are coverage of the r=32 -> tail=1 mapping; they do not discriminate the rounding.
+    // Short-tail path (TAIL_SUBS). Both buffer parities matter -- the tile count decides whether
+    // the short tile lands in the first or the second LDS buffer, and an early peel got one wrong.
+    f += !verify_256x256_tail(256, 256, 1024);  // Kp=1152, 6 k-tiles, tail 1 -> buffer 1
+    f += !verify_256x256_tail(256, 512, 1600);  // Kp=1728, 9 k-tiles, tail 1 -> buffer 0
+    f += !verify_256x256_tail(256, 256, 320);   // Kp= 384, 2 k-tiles, tail 2 -> buffer 1
+    f += !verify_256x256_tail(256, 512, 512);   // Kp= 576, 3 k-tiles, tail 2 -> buffer 0
+    // K % 64 == 32: a HALF-real last sub-slab, which the old `K_real % 64 == 0` guard refused to
+    // touch. Grouped by r = K % K_TILE and by what a floor rounding does, measured with floor
+    // patched in: r==32 makes floor yield 0, merely disabling the tail, so those two do not
+    // discriminate the rounding; r==96 and r==160 DO fail under floor.
     f += !verify_256x256_tail(256, 256, 992);   // Kp=1152, 6 k-tiles, tail 1 -> buffer 1
     f += !verify_256x256_tail(256, 512, 800);   // Kp= 960, 5 k-tiles, tail 1 -> buffer 0
-    //   r == 96: floor runs 1 sub-slab where 2 are real, so these DO fail under floor.
     f += !verify_256x256_tail(256, 256, 1056);  // Kp=1152, 6 k-tiles, tail 2 -> buffer 1
     f += !verify_256x256_tail(256, 512, 864);   // Kp= 960, 5 k-tiles, tail 2 -> buffer 0
-    //   r == 160: the whole last tile is real, so tail_subs_for() normalizes 3 down to 0 and this
-    //   runs the plain kernel. Also fails under floor (2 where 3 are real). It does NOT cover the
-    //   normalize itself -- an un-normalized 3 reaches the same plain kernel, since dispatch wires
-    //   no TAIL_SUBS == 3 branch.
-    f += !verify_256x256_tail(256, 256, 1120);  // Kp=1152, nothing to skip
+    f += !verify_256x256_tail(256, 256, 1120);  // Kp=1152, r=160, nothing to skip
     // pad-B-only / compact-A recipe. K = multiple of 32 (MX block) but NOT of K_TILE, so a real
     // K-tail exists (exercises the inter-row overlap + end pad + NaN-safe scale tail):
     f += !verify_compact(4096, 4096, 224);  // -> 256x256, 2 k_tiles

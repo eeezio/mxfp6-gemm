@@ -53,10 +53,9 @@ TileChoice choose_tile(int M, int N, int Kp) {
     // fixed cost over a quarter of the work: 1274 TFLOPs against 1455 on 2048x102272x1024. So run
     // 256x256 over a ceil(N/256) grid and mask the last N-tile at the store instead. Needs
     // (N/32)%NPW == 0, which for NPW=4 is exactly N%128==0; M must divide 256 (no M-remainder).
-    // Any N reaching here is N%256==128, so the overshoot is always one 128-column half-tile and
-    // the waste is 128/N. N>=256 demands one full N-tile to amortize it: at N=128 there is none,
-    // half the tile is masked, and it measured 0.49x against the 128x128 below (g4-1 2026-08-18,
-    // 10 K values, ranges disjoint).
+    // Any N reaching here is N%256==128, so the overshoot is one 128-column half-tile and the
+    // waste is 128/N. N>=256 demands a full N-tile to amortize it; N=128 has none, masks half the
+    // tile, and measured 0.49x against the 128x128 below (10 K values, ranges disjoint).
     if ((M % 256) == 0 && (N % 128) == 0 && N >= 256) return {256, 256, 4, 4};
     if ((M % 128) == 0 && (N % 128) == 0) return {128, 128, 2, 2};
     return {256, 256, 4, 4};  // no implemented tile covers this shape — caller must pad M/N
@@ -69,8 +68,7 @@ size_t gemm_workspace_size(int M, int N, int Kp) {
 void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, const uint8_t* dsA,
           const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes, void* ws,
           size_t ws_bytes, int K_real) {
-    // A K_real that does not pad to this Kp would make the kernel skip REAL work, so drop it
-    // rather than trust it. 0 disables the short-tail path entirely.
+    // A K_real that does not pad to this Kp would make the kernel skip REAL work. Drop, not trust.
     if (K_real > 0 && kpad(K_real) != Kp) K_real = 0;
     switch (ot) {
         case OutType::F32:

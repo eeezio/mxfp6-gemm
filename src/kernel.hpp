@@ -142,9 +142,8 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     constexpr int SA_PAD = ((M_PW + 3) / 4) * 4, SB_PAD = ((N_PW + 3) / 4) * 4;
     constexpr int NDA = SA_PAD / 4, NDB = SB_PAD / 4;
     static_assert(NDA == 1 && NDB == 1, "tiled-scale path assumes <=4 blocks/wave");
-    // TAIL_SUBS drops the trailing all-pad sub-slabs of the LAST tile of the whole K. Under split-K
-    // "last tile" is per segment, and only the final segment's is the padded one, so the two are
-    // incompatible until that is threaded through.
+    // TAIL_SUBS drops the trailing all-pad sub-slabs of the last tile of the WHOLE K. Under
+    // split-K only the final segment's last tile is the padded one, hence the second assert.
     static_assert(TAIL_SUBS >= 0 && TAIL_SUBS <= K64_PER_TILE, "TAIL_SUBS range");
     static_assert(!(TAIL_SUBS && SPLITK), "TAIL_SUBS is not implemented for split-K");
     int sa_grp = wg_m * WAVES_M + wm, sb_grp = wg_n * WAVES_N + wn;
@@ -187,10 +186,8 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     };
 
     // compute tile kt_cur from buffer `cur`; if adrip, drip A(kt_nxt) into buffer nxt_base.
-    // SUBS_T is a compile-time count of 64-K sub-slabs to actually run (an integral_constant, so
-    // NB_EFF folds and the p loop stays fully unrolled). Every tile but the last passes
-    // K64_PER_TILE; the last tile passes TAIL_SUBS when the caller told us how much of the padded
-    // K is real, which drops the all-zero sub-slabs' MFMA *and* their B loads.
+    // SUBS_T = how many 64-K sub-slabs to run, as an integral_constant so NB_EFF folds and the p
+    // loop stays fully unrolled. FULL for every tile but the last, TAIL for the short one.
     auto compute = [&](auto SUBS_T, uint32_t cur, uint32_t nxt_base, int kt_cur, int kt_nxt,
                        bool adrip, const int (*sa)[NDA], const int (*sb)[NDB]) {
         constexpr int NB_EFF = decltype(SUBS_T)::value * N_PW;
@@ -260,9 +257,8 @@ __global__ void __launch_bounds__(256, MIN_OCC)
                                                     arsrc, 0, ISSUES_A);
     constexpr auto FULL = std::integral_constant<int, K64_PER_TILE>{};
     constexpr auto TAIL = std::integral_constant<int, TAIL_SUBS ? TAIL_SUBS : K64_PER_TILE>{};
-    // With TAIL_SUBS the last tile is short, so the pairwise loop covers one tile fewer. The drip
-    // lookahead still uses k_tiles_seg: the short tile's A must be dripped like any other (only
-    // its own MFMA/B are dropped, its LDS staging is not).
+    // The pairwise loop covers one tile fewer when the last one is short. The drip lookahead keeps
+    // using k_tiles_seg: only the short tile's MFMA and B are dropped, its A staging is not.
     int n_full = k_tiles_seg - (TAIL_SUBS ? 1 : 0);
     int kt = 0;
     if constexpr (KGE2) __builtin_assume(k_tiles_seg >= 2);
@@ -280,15 +276,12 @@ __global__ void __launch_bounds__(256, MIN_OCC)
     }
     // kt is even here, so it is either n_full-1 (one full tile left, in buf0) or n_full (none).
     if constexpr (TAIL_SUBS) {
-        // The short last tile, peeled out of the pairwise loop. Two things here are load-bearing:
+        // Short last tile, peeled out of the pairwise loop. Two things are load-bearing:
         //  * ONE inlined copy of the short compute, not one per buffer parity -- a second copy
-        //    pins these kernels at arch=256 and spills 300-600 bytes.
-        //  * Its scales are re-read into DEDICATED arrays rather than selecting sa0/sa1 through a
-        //    runtime pointer. Taking the address of those arrays makes them escape, LLVM puts them
-        //    in scratch, and the scratch traffic interleaves with load_scales's vmcnt-invisible
-        //    inline-asm loads -- which reads the registers before the loads land. That produced a
-        //    memory fault, not a wrong number, and `vgpr_spill_count` stays 0 the whole time.
-        //    Re-reading costs two dwordx3 on the last tile only.
+        //    pins these kernels at arch=256 and spills.
+        //  * Dedicated scale arrays, re-read. Selecting sa0/sa1 through a runtime pointer makes
+        //    them escape to scratch, and that traffic races load_scales's vmcnt-invisible asm
+        //    loads -- a memory FAULT, with vgpr_spill_count still 0.
         uint32_t tail_buf = 0;
         if (kt < n_full) {  // odd n_full: one full tile left in buf0, the short tile follows in buf1
             if (HARD_WAIT) wait_vmcnt(0);
@@ -329,10 +322,10 @@ __global__ void __launch_bounds__(256, MIN_OCC)
             for (int g = 0; g < 4; g++) {
                 int m0 = mb + g * 8 + nh * 4;
                 if constexpr (!SPLITK && __is_same(OutT, __half)) {
-                    // One v_cvt_pk_f16_f32 converts two accumulators at once (RNE, same rounding as the
-                    // scalar v_cvt_f16_f32 it replaces -- pkrtz would be round-toward-zero). The pair lands on
-                    // two different rows (stride N), so it still needs two stores -- but the second
-                    // should be global_store_short_d16_hi, i.e. no extra shift.
+                    // One v_cvt_pk_f16_f32 per two accumulators, same rounding as the scalar
+                    // v_cvt_f16_f32 it replaces (RNE; pkrtz would be round-toward-zero). The pair
+                    // lands on two rows, so still two stores -- the second as
+                    // global_store_short_d16_hi, no shift. Epilogue 768 -> 640 instructions.
                     typedef __fp16 fp16x2 __attribute__((ext_vector_type(2)));
                     __fp16* Dh = reinterpret_cast<__fp16*>(D);
 #pragma unroll
