@@ -284,7 +284,7 @@ A bytes = M · (N/NT) · Kp · 0.75      ∝ 1/NT     (A is re-read once per N-t
 B bytes = (M/MT) · N · Kp · 0.75      ∝ 1/MT
 ```
 
-At `M=2048, N=6144, Kp=105792` (MI350X `bg-1w300-k2-3a`, clocks locked at 2200 MHz, n=5, tiles forced
+At `M=2048, N=6144, Kp=105792` (MI350X gfx950, clocks locked at 2200 MHz, n=5, tiles forced
 through a test-only bypass of `choose_tile`, XCD swizzle off — so these are tile effects only):
 
 | tile | A | B | total | WGs | CU waves | wave-quantized cost | measured |

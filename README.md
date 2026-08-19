@@ -66,9 +66,9 @@ different ways depending on K, and each gets its own route (see
   runs 3 full waves against 128×256's 2 half-empty ones. Its B slice does overflow L2, but shrinking
   that slice is not why it wins — see §9.
 
-Measured on **MI350X** `bg-1w300-k2-3a`, ours + CK in one session, interleaved, FP16, `2048 × 6144`
+Measured on **MI350X** (gfx950), ours + CK in one session, interleaved, FP16, `2048 × 6144`
 (median of 3 reps; raw:
-[`prof_results/bench_mi350x_k2-3a_2026-07-29.txt`](prof_results/bench_mi350x_k2-3a_2026-07-29.txt)):
+[`prof_results/bench_mi350x_2026-07-29.txt`](prof_results/bench_mi350x_2026-07-29.txt)):
 
 | M × N × K | CK MXFP8 | before (128×256) | after | route | after vs CK |
 |---|---:|---:|---:|---|---:|
@@ -96,7 +96,7 @@ session reproduces its 2026-07-29 numbers to within 1% (K=16128: 1669 vs 1654; K
 
 Both routes are auto-selected in `choose_tile`; shapes that meet neither condition are
 byte-for-byte unchanged. Raw:
-[`prof_results/bench_mi350x_k2-3a_2026-08-11.txt`](prof_results/bench_mi350x_k2-3a_2026-08-11.txt).
+[`prof_results/bench_mi350x_2026-08-11.txt`](prof_results/bench_mi350x_2026-08-11.txt).
 
 > Cross-machine absolute TFLOPs are not comparable — only same-session ratios and deltas are. The
 > table above is one machine, one session. Earlier revisions of this section quoted a 128×256 →

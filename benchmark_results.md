@@ -13,21 +13,25 @@ Columns:
   faster than `origin/main`). This is the only column where both numbers share a machine, a ROCm,
   and a session, so it is the one that supports a causal claim.
 
-**`ours_*` re-measured 2026-08-18** on host `bg-1w300-g4-1` (gfx950, device `0x75a0`), binaries
-built locally in `rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.13_pytorch_release_2.9.1` (HIP 7.0.51831 —
-same ROCm major/minor as the rows it replaces) and executed under a ROCm 7.2.3 container on the
-host. `HIP_VISIBLE_DEVICES=0`, `rocm-smi --setperfdeterminism 2200`, median of 3 interleaved passes
+Two MI350X (gfx950, 256 CU) machines appear below. **Host A** carried the 2026-07-29 and
+2026-08-11 runs, **host B** the 2026-08-18 re-measurement. They are distinguished only because
+mixing them inside one ratio would be dishonest.
+
+**`ours_*` re-measured 2026-08-18** on host B (device `0x75a0`), binaries built locally in
+`rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.13_pytorch_release_2.9.1` (HIP 7.0.51831 — same ROCm
+major/minor as the rows it replaces) and executed under a ROCm 7.2.3 container.
+`HIP_VISIBLE_DEVICES=0`, `rocm-smi --setperfdeterminism 2200`, median of 3 interleaved passes
 (arms alternate on every shape and every rep). Raw:
-[`prof_results/ab_pr7fix_vs_main_g4-1_2026-08-18.tsv`](prof_results/ab_pr7fix_vs_main_g4-1_2026-08-18.tsv).
+[`prof_results/ab_pr7fix_vs_main_2026-08-18.tsv`](prof_results/ab_pr7fix_vs_main_2026-08-18.tsv).
 The pre-fix sweep that surfaced the `N=128` regression, and a 9-rep recheck of its marginal shapes,
-are in [`ab_pr7_vs_main_g4-1_...`](prof_results/ab_pr7_vs_main_g4-1_2026-08-18.tsv) and
-[`..._recheck9_...`](prof_results/ab_pr7_vs_main_recheck9_g4-1_2026-08-18.tsv).
+are in [`ab_pr7_vs_main_...`](prof_results/ab_pr7_vs_main_2026-08-18.tsv) and
+[`..._recheck9_...`](prof_results/ab_pr7_vs_main_recheck9_2026-08-18.tsv).
 
 **`ck_*` are NOT from that run.** They are carried over unchanged from the 2026-08-11 measurement on
-`bg-1w300-k2-3a` (image `rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0`, CK
+host A (image `rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0`, CK
 `tile_example_mx_flatmm -mx_prec=fp8xfp8 -v=0 -warmup=20 -repeat=50`, raw
-[`prof_results/bench_mi350x_k2-3a_2026-08-11.txt`](prof_results/bench_mi350x_k2-3a_2026-08-11.txt)).
-So `ours/CK` mixes two hosts and is indicative only. `g4-1` measured slower than `k2-3a` on shapes
+[`prof_results/bench_mi350x_2026-08-11.txt`](prof_results/bench_mi350x_2026-08-11.txt)).
+So `ours/CK` mixes two hosts and is indicative only. Host B measured slower than host A on shapes
 both have seen (N=105728 K=1024: 0.3333 ms against 0.2875 ms), so the mixed ratios more likely
 understate this library than flatter it; no correction has been applied. Same-machine CK for the
 shapes that support it is in the section below.
@@ -157,11 +161,11 @@ ranges overlap `main`'s, because 3 runs land at 0.0143–0.0157 ms (faster than 
 0.0153) and 9 land at 0.0176–0.0203. `main` is tight at 0.0153–0.0170 throughout. Both arms route to
 128x384, which is one of the two routes carrying the XCD grid swizzle. Flagged, not diagnosed.
 
-### Same-machine CK, 2026-08-18 (`g4-1`) — 18 of 50 shapes
+### Same-machine CK, 2026-08-18 (host B) — 18 of 50 shapes
 
-The table above pairs `ours` from `g4-1` with `ck` from `k2-3a`. This section removes that mismatch
+The table above pairs `ours` from host B with `ck` from host A. This section removes that mismatch
 for the shapes where it can. Raw:
-[`prof_results/ck_untuned_g4-1_2026-08-18.tsv`](prof_results/ck_untuned_g4-1_2026-08-18.tsv).
+[`prof_results/ck_untuned_2026-08-18.tsv`](prof_results/ck_untuned_2026-08-18.tsv).
 
 Two limits, both measured rather than assumed:
 
@@ -332,8 +336,8 @@ when `k_tiles%S==0`). Verified vs CPU reference on the small uneven analog `2048
 The main table gives absolutes; this is the A/B that attributes them to the route change. The
 `128×256` baseline and the `128×384` build were compiled from the same source pair in one container
 invocation and run **interleaved, 3 reps**, with CK in the same session. M=2048, N=6144, FP16, on
-`bg-1w300-k2-3a`. Raw:
-[`prof_results/bench_mi350x_k2-3a_2026-07-29.txt`](prof_results/bench_mi350x_k2-3a_2026-07-29.txt).
+host A. Raw:
+[`prof_results/bench_mi350x_2026-07-29.txt`](prof_results/bench_mi350x_2026-07-29.txt).
 
 | K | baseline (128×256) | **128×384** | Δ | CK mxfp8 | baseline/CK | **new/CK** |
 |---:|---:|---:|:---:|---:|:---:|:---:|
@@ -373,7 +377,7 @@ proportionally more than the wave-quantization argument alone predicts.
    either, and the win was the dropped half-empty CU wave. Removing the K-gate on the wave-saving
    128×384 arm then took the same shape to **2557 TF (+44.7%)** with a 3× *larger* B slice.
    See `docs/OPTIMIZATIONS.md §9` and
-   [`prof_results/bench_mi350x_k2-3a_2026-08-11.txt`](prof_results/bench_mi350x_k2-3a_2026-08-11.txt).
+   [`prof_results/bench_mi350x_2026-08-11.txt`](prof_results/bench_mi350x_2026-08-11.txt).
 6. **Split-K's own ceiling** — the FP32 partial-sum write + reduce round-trip caps speedup well below the ideal `S×` (2.99× of an ideal 4× for 105728).
 7. ~~**Wide-N wave quantization**~~ — **RESOLVED.** `2048×6144×{512,4096,16128}` ran 384 WGs on
    256 CUs (1.5 waves). Routing `N%384==0` shapes to a **128×384 tile** gives exactly 256 WGs;

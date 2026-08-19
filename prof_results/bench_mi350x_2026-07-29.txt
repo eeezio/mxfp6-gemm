@@ -1,6 +1,6 @@
 128x384 tile — same-machine, same-session A/B vs the 128x256 baseline, plus CK MXFP8.
 
-Machine : MI350X (gfx950, 256 CU), bg-1w300-k2-3a.adc.amd.com (10.6.244.220)
+Machine : MI350X (gfx950, 256 CU), host A
 Image   : rocm/atom:latest  (docker run -e HIP_VISIBLE_DEVICES=0 ...)
 Date    : 2026-07-29
 Shape   : M=2048, N=6144, FP16 output
