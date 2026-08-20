@@ -1,6 +1,6 @@
 XCD swizzle + KGE2 + un-K-gated 128x384 — same-machine, same-session A/B, plus CK MXFP8.
 
-Machine : MI350X (gfx950, 256 CU), bg-1w300-k2-3a.adc.amd.com (10.6.244.220)
+Machine : MI350X (gfx950, 256 CU), host A
 Image   : rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
 Date    : 2026-08-11
 Clocks  : rocm-smi --setperfdeterminism 2200 for every measured section

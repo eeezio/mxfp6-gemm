@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <cstdio>
+#include <type_traits>
 // INTERNAL: templated GEMM launch for the unified hybrid drip-A kernel. The public,
 // type-erased entry points (mxfp6::gemm / mxfp6::choose_tile) live in mxfp6/gemm.hpp and
 // are defined in src/gemm.cpp, which instantiates this template for F32/F16/BF16.
@@ -22,6 +23,11 @@ namespace detail {
 // A-slices are 10 MB at large K, so grouping by wg_n costs more A locality than it buys in B).
 // 128x128 and the unmeasured 128x256 therefore stay unswizzled.
 constexpr int SWZ_XCD = -1;
+
+// B-ring depth on the 256x256 route: 8 at or above this N, the default 5 below. The gate is
+// required -- the deeper ring wins +5.5~6.7% here and loses below (-1.05% at N=16128, -3.5% at
+// 4096^3). Empirical: the lowest measured win, no mechanism established. Re-measure on any other part.
+constexpr int BRING8_MIN_N = 81920;
 
 // Split factor S for (M,N,Kp): the number of K-segments to split across independent workgroups
 // for a WG-starved shape (S==1 means "do not split"). SINGLE SOURCE OF TRUTH — both the public
@@ -58,6 +64,41 @@ inline size_t splitk_workspace_bytes(int M, int N, int Kp) {
     return S > 1 ? (size_t)S * (size_t)M * N * sizeof(float) : 0;
 }
 
+// 64-K sub-slabs of the LAST k-tile that still carry real data. The kernel skips the rest, both
+// their MFMA and their B loads. 0 = run the whole tile.
+//
+// Rounds UP: MFMA consumes K=64 atomically, so a partly-real sub-slab must run in full, and its
+// padding contributes 0 anyway. Over-running is wasteful, under-running is wrong -- which is why
+// no divisibility guard on K_real is needed. An entirely real last tile normalizes back to 0
+// rather than paying a barrier and a scale re-read to save nothing.
+inline int tail_subs_for(int K_real) {
+    if (K_real <= 0) return 0;
+    const int run = (K_real % K_TILE + 63) / 64;
+    return run == K_TILE / 64 ? 0 : run;
+}
+
+// The one place runtime tail_subs becomes compile-time TAIL_SUBS. Every 256x256 launch goes
+// through here so the template argument lists cannot drift apart -- identical arguments are the
+// only reason the force-tile short-tail arms cost no extra kernels. TAIL_ARMS must be a template
+// parameter: a runtime 0 would still instantiate the unused TAIL_SUBS 1 and 2 kernels.
+template <typename OutT, bool KGE2, bool NMASK, int PFD, bool TAIL_ARMS>
+inline void launch_256x256(int tail_subs, dim3 g, int lds, const void* dA, const void* dBsh,
+                           const uint8_t* dsA, const uint8_t* dsB, OutT* dD, int N, int kit,
+                           int A_row_bytes, int B_row_bytes, int k_tiles) {
+    static_assert(K_TILE / 64 == 3, "launch_256x256 enumerates tail_subs 1..K_TILE/64-1 by hand");
+    auto go = [&](auto TS) {
+        lds_gemm_hybrid_dripA<256, 256, K_TILE, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, PFD, true, 1,
+                              1, 1, 0, NMASK, decltype(TS)::value>
+            <<<g, dim3(256), lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes, 0,
+                                    k_tiles, nullptr);
+    };
+    if constexpr (KGE2 && TAIL_ARMS) {
+        if (tail_subs == 1) return go(std::integral_constant<int, 1>{});
+        if (tail_subs == 2) return go(std::integral_constant<int, 2>{});
+    }
+    go(std::integral_constant<int, 0>{});
+}
+
 // Kp = K padded to a multiple of K_TILE(=192). Caller must have tiled the scales with
 // choose_tile(...).MPW/NPW and preshuffled B (preshuffle_B).
 // ws/ws_bytes: caller-provided split-K workspace (see gemm_workspace_size). If a WG-starved shape
@@ -66,7 +107,10 @@ inline size_t splitk_workspace_bytes(int M, int N, int Kp) {
 template <typename OutT, bool KGE2>
 inline void dispatch_gemm_kge(int M, int N, int Kp, const void* dA, const void* dBsh,
                               const uint8_t* dsA, const uint8_t* dsB, OutT* dD, int A_row_bytes,
-                              int B_row_bytes, void* ws, size_t ws_bytes) {
+                              int B_row_bytes, void* ws, size_t ws_bytes, int K_real = 0) {
+    // Only the 256x256 route at N >= BRING8_MIN_N acts on this; other routes ignore K_real.
+    // Deliberate: the short tail measured -0.52% at N=16128.
+    const int tail_subs = tail_subs_for(K_real);
     constexpr int KT = K_TILE;
     dim3 blk(256);
     int kit = Kp / 64;
@@ -159,16 +203,21 @@ inline void dispatch_gemm_kge(int M, int N, int Kp, const void* dA, const void* 
         // half of one N-tile (measured 1274 vs 1455 TFLOPs on 2048x102272x1024).
         dim3 g(M / 256, (N + 255) / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, 5, true, 1, 1, 1,
-                              0, true>
-            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
-                              0, k_tiles, nullptr);
+        if (N >= BRING8_MIN_N)
+            launch_256x256<OutT, KGE2, true, 8, true>(tail_subs, g, lds, dA, dBsh, dsA, dsB, dD, N,
+                                                      kit, A_row_bytes, B_row_bytes, k_tiles);
+        else
+            launch_256x256<OutT, KGE2, true, 5, false>(tail_subs, g, lds, dA, dBsh, dsA, dsB, dD, N,
+                                                       kit, A_row_bytes, B_row_bytes, k_tiles);
     } else {
         dim3 g(M / 256, N / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2>
-            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
-                              0, k_tiles, nullptr);
+        if (N >= BRING8_MIN_N)
+            launch_256x256<OutT, KGE2, false, 8, true>(tail_subs, g, lds, dA, dBsh, dsA, dsB, dD, N,
+                                                       kit, A_row_bytes, B_row_bytes, k_tiles);
+        else
+            launch_256x256<OutT, KGE2, false, 5, false>(tail_subs, g, lds, dA, dBsh, dsA, dsB, dD,
+                                                        N, kit, A_row_bytes, B_row_bytes, k_tiles);
     }
 }
 
@@ -177,13 +226,13 @@ inline void dispatch_gemm_kge(int M, int N, int Kp, const void* dA, const void* 
 template <typename OutT>
 inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh,
                           const uint8_t* dsA, const uint8_t* dsB, OutT* dD, int A_row_bytes,
-                          int B_row_bytes, void* ws, size_t ws_bytes) {
+                          int B_row_bytes, void* ws, size_t ws_bytes, int K_real = 0) {
     if (Kp >= 2 * K_TILE)
         dispatch_gemm_kge<OutT, true>(M, N, Kp, dA, dBsh, dsA, dsB, dD, A_row_bytes, B_row_bytes,
-                                      ws, ws_bytes);
+                                      ws, ws_bytes, K_real);
     else
         dispatch_gemm_kge<OutT, false>(M, N, Kp, dA, dBsh, dsA, dsB, dD, A_row_bytes, B_row_bytes,
-                                       ws, ws_bytes);
+                                       ws, ws_bytes, K_real);
 }
 
 // Like dispatch_gemm but uses a caller-supplied TileChoice instead of choose_tile(). No split-K.
@@ -191,7 +240,8 @@ inline void dispatch_gemm(int M, int N, int Kp, const void* dA, const void* dBsh
 template <typename OutT, bool KGE2>
 inline void dispatch_gemm_force_tile_kge(int M, int N, int Kp, TileChoice tc, const void* dA,
                                          const void* dBsh, const uint8_t* dsA, const uint8_t* dsB,
-                                         OutT* dD, int A_row_bytes, int B_row_bytes) {
+                                         OutT* dD, int A_row_bytes, int B_row_bytes, int K_real = 0) {
+    const int tail_subs = tail_subs_for(K_real);
     constexpr int KT = K_TILE;
     dim3 blk(256);
     int kit = Kp / 64;
@@ -217,29 +267,45 @@ inline void dispatch_gemm_force_tile_kge(int M, int N, int Kp, TileChoice tc, co
     } else if (N % 256 != 0) {
         dim3 g(M / 256, (N + 255) / 256);  // NMASK, as in dispatch_gemm_kge above
         int lds = 2 * (256 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2, 5, true, 1, 1, 1,
-                              0, true>
-            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
-                              0, k_tiles, nullptr);
+        // PFD asymmetry is deliberate: tail arms must be PFD=8 to dedup against the routed kernel,
+        // the plain arm PFD=5 to match the routed small-N one. See the else branch for why at all.
+        if constexpr (KGE2) {
+            if (tail_subs) {
+                launch_256x256<OutT, KGE2, true, 8, true>(tail_subs, g, lds, dA, dBsh, dsA, dsB, dD,
+                                                          N, kit, A_row_bytes, B_row_bytes, k_tiles);
+                return;
+            }
+        }
+        launch_256x256<OutT, KGE2, true, 5, false>(tail_subs, g, lds, dA, dBsh, dsA, dsB, dD, N, kit,
+                                                   A_row_bytes, B_row_bytes, k_tiles);
     } else {
         dim3 g(M / 256, N / 256);
         int lds = 2 * (256 * (KT * 6 / 8));
-        lds_gemm_hybrid_dripA<256, 256, KT, 2, 2, 1, SWZ_XCD, OutT, false, KGE2>
-            <<<g, blk, lds>>>(dA, dBsh, dsA, dsB, dD, N, kit, A_row_bytes, B_row_bytes,
-                              0, k_tiles, nullptr);
+        // The short-tail arm is wired here only because the routed one needs N >= BRING8_MIN_N,
+        // which no CPU reference can check. Same template args, so it adds no kernels.
+        if constexpr (KGE2) {
+            if (tail_subs) {
+                launch_256x256<OutT, KGE2, false, 8, true>(tail_subs, g, lds, dA, dBsh, dsA, dsB,
+                                                           dD, N, kit, A_row_bytes, B_row_bytes,
+                                                           k_tiles);
+                return;
+            }
+        }
+        launch_256x256<OutT, KGE2, false, 5, false>(tail_subs, g, lds, dA, dBsh, dsA, dsB, dD, N, kit,
+                                                    A_row_bytes, B_row_bytes, k_tiles);
     }
 }
 
 template <typename OutT>
 inline void dispatch_gemm_force_tile(int M, int N, int Kp, TileChoice tc, const void* dA,
                                      const void* dBsh, const uint8_t* dsA, const uint8_t* dsB,
-                                     OutT* dD, int A_row_bytes, int B_row_bytes) {
+                                     OutT* dD, int A_row_bytes, int B_row_bytes, int K_real = 0) {
     if (Kp >= 2 * K_TILE)
         dispatch_gemm_force_tile_kge<OutT, true>(M, N, Kp, tc, dA, dBsh, dsA, dsB, dD, A_row_bytes,
-                                                 B_row_bytes);
+                                                 B_row_bytes, K_real);
     else
         dispatch_gemm_force_tile_kge<OutT, false>(M, N, Kp, tc, dA, dBsh, dsA, dsB, dD, A_row_bytes,
-                                                  B_row_bytes);
+                                                  B_row_bytes, K_real);
 }
 
 }  // namespace detail

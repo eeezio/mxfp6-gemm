@@ -26,7 +26,7 @@ static constexpr int KT = K_TILE;
 namespace mxfp6 {
 void gemm_force_tile(OutType ot, int M, int N, int Kp, TileChoice tc, const void* dA,
                      const void* dBsh, const uint8_t* dsA, const uint8_t* dsB, void* dD,
-                     int A_row_bytes, int B_row_bytes);
+                     int A_row_bytes, int B_row_bytes, int K_real = 0);
 }  // namespace mxfp6
 
 template <class F>
@@ -111,7 +111,7 @@ static bool verify(int M, int N, int K, bool force_ws = false) {
     size_t wsb = gemm_workspace_size(M, N, x.Kp);
     if (!wsb && force_ws) wsb = (size_t)4 * M * N * sizeof(float);
     if (wsb) hipMalloc(&ws, wsb);
-    gemm(OutType::F32, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb);
+    gemm(OutType::F32, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb, K);
     hipDeviceSynchronize();
     std::vector<float> Dg((size_t)M * N);
     hipMemcpy(Dg.data(), dD, (size_t)M * N * 4, hipMemcpyDeviceToHost);
@@ -227,6 +227,33 @@ static bool verify_128x128(int M, int N, int K) {
     return ok;
 }
 
+// Correctness check for the 256x256 SHORT-TAIL path on SMALL shapes. The routed short tail only
+// fires at N >= BRING8_MIN_N, which no CPU reference can check, so force the tile and hand it the
+// true K. M and N must be multiples of 256.
+static bool verify_256x256_tail(int M, int N, int K) {
+    constexpr TileChoice tc = {256, 256, 4, 4};
+    Dev x = setup(M, N, K, tc);
+    std::vector<float> Dref((size_t)M * N);
+    mxfp6_gemm_ref(x.Aq, x.Bq, Dref.data(), M, x.Kp, N);
+    float* dD;
+    hipMalloc(&dD, (size_t)M * N * 4);
+    hipMemset(dD, 0x5A, (size_t)M * N * 4);
+    gemm_force_tile(OutType::F32, M, N, x.Kp, tc, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, K);
+    hipDeviceSynchronize();
+    std::vector<float> Dg((size_t)M * N);
+    hipMemcpy(Dg.data(), dD, (size_t)M * N * 4, hipMemcpyDeviceToHost);
+    hipFree(dD);
+    float er = 0, mx = 0;
+    for (size_t i = 0; i < (size_t)M * N; i++) {
+        er = fmaxf(er, fabsf(Dg[i] - Dref[i]));
+        mx = fmaxf(mx, fabsf(Dref[i]));
+    }
+    bool ok = er < 2e-2f * fmaxf(1.f, mx);
+    printf("  256x256 tail %4dx%4dx%4d (Kp=%d) : %s\n", M, N, K, x.Kp, ok ? "OK" : "FAIL<<<");
+    teardown(x);
+    return ok;
+}
+
 // Correctness check for the 128x384 kernel path on SMALL shapes (fast CPU ref).
 // Uses WAVES_M=1, WAVES_N=4: MPW=4, NPW=3. M must be a multiple of 128; N of 384.
 static bool verify_128x384(int M, int N, int K) {
@@ -285,6 +312,11 @@ static bool check_routing() {
         // divides (measured 1435 vs 1273 TFLOPs on the first of these).
         {2048,102272,  1024, 256, 256, "partial last N-tile beats the 4-acc tile that divides"},
         {2048,  1408,  4096, 256, 256, "same, small N"},
+        // N=128 is the one N where the masked tile has no full N-tile to amortize it: 100% waste,
+        // measured 0.49x. It must take the 128x128 that divides instead.
+        {2048,   128,  1024, 128, 128, "N<256: masked 256x256 would compute 2x the columns"},
+        {2048,   128,  1840, 128, 128, "same, deeper K"},
+        { 256,   128,  1024, 128, 128, "same at the smallest M%256==0"},
         {2048, 12672,  1024, 128, 384, "N%384==0 keeps the exact route over the masked one"},
         { 896,  1408,  4096, 128, 128, "M%256!=0 cannot mask N: needs a tile that divides both"},
         {2048,  6144, 105728, 128, 384, "wave-saving 128x384 is not K-gated (measured +44%)"},
@@ -377,7 +409,7 @@ static void perf(int M, int N, int K) {
     size_t wsb = gemm_workspace_size(M, N, x.Kp);
     if (wsb) hipMalloc(&ws, wsb);
     auto run = [&] {
-        gemm(OutType::F16, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb);
+        gemm(OutType::F16, M, N, x.Kp, x.dA, x.dBsh, x.dsA, x.dsB, dD, x.Ar, x.Br, ws, wsb, K);
     };
     double ms = bench(run);
     int base_wg = (M / tc.MT) * (N / tc.NT);
@@ -402,6 +434,21 @@ int main(int argc, char** argv) {
     f += !verify(512, 512, 768);    // -> 128x256 path (wg256<CU)
     f += !verify(768, 1280, 960);   // -> 128x256, non-square
     f += !verify(4096, 4096, 768);  // -> 256x256 path (wg256=256), small K for fast ref
+    // Short-tail path (TAIL_SUBS). Both buffer parities matter -- the tile count decides whether
+    // the short tile lands in the first or the second LDS buffer, and an early peel got one wrong.
+    f += !verify_256x256_tail(256, 256, 1024);  // Kp=1152, 6 k-tiles, tail 1 -> buffer 1
+    f += !verify_256x256_tail(256, 512, 1600);  // Kp=1728, 9 k-tiles, tail 1 -> buffer 0
+    f += !verify_256x256_tail(256, 256, 320);   // Kp= 384, 2 k-tiles, tail 2 -> buffer 1
+    f += !verify_256x256_tail(256, 512, 512);   // Kp= 576, 3 k-tiles, tail 2 -> buffer 0
+    // K % 64 == 32: a HALF-real last sub-slab, which the old `K_real % 64 == 0` guard refused to
+    // touch. Grouped by r = K % K_TILE and by what a floor rounding does, measured with floor
+    // patched in: r==32 makes floor yield 0, merely disabling the tail, so those two do not
+    // discriminate the rounding; r==96 and r==160 DO fail under floor.
+    f += !verify_256x256_tail(256, 256, 992);   // Kp=1152, 6 k-tiles, tail 1 -> buffer 1
+    f += !verify_256x256_tail(256, 512, 800);   // Kp= 960, 5 k-tiles, tail 1 -> buffer 0
+    f += !verify_256x256_tail(256, 256, 1056);  // Kp=1152, 6 k-tiles, tail 2 -> buffer 1
+    f += !verify_256x256_tail(256, 512, 864);   // Kp= 960, 5 k-tiles, tail 2 -> buffer 0
+    f += !verify_256x256_tail(256, 256, 1120);  // Kp=1152, r=160, nothing to skip
     // pad-B-only / compact-A recipe. K = multiple of 32 (MX block) but NOT of K_TILE, so a real
     // K-tail exists (exercises the inter-row overlap + end pad + NaN-safe scale tail):
     f += !verify_compact(4096, 4096, 224);  // -> 256x256, 2 k_tiles

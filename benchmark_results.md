@@ -7,72 +7,94 @@ Columns:
 - `ours_ms` / `ours_TF` = this library's latency and effective TFLOPs (nominal `2·M·N·K` over the
   measured latency, so K-padding waste is charged to us)
 - `ck_ms` / `ck_TF` = CK MXFP8 latency and effective TFLOPs
-- `ours/CK` = `ours_TF / ck_TF` (>1.0 = this library wins)
+- `ours/CK` = `ours_TF / ck_TF` (>1.0 = this library wins). **The two halves of this ratio come
+  from different hosts** — see the provenance note below before quoting it.
+- `vs main` = `main_ms / ours_ms` from an interleaved A/B in the same session (>1.0 = this branch is
+  faster than `origin/main`). This is the only column where both numbers share a machine, a ROCm,
+  and a session, so it is the one that supports a causal claim.
 
-**Measurement (2026-08-11):** MI350X (gfx950, 256 CU) `bg-1w300-k2-3a`, image
-`rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0`, `HIP_VISIBLE_DEVICES=0`, clocks
-locked at 2200, median of 3 `test_gemm M N K` passes per shape. CK is
-`tile_example_mx_flatmm -mx_prec=fp8xfp8 -v=0 -warmup=20 -repeat=50`. Raw:
-[`prof_results/bench_mi350x_k2-3a_2026-08-11.txt`](prof_results/bench_mi350x_k2-3a_2026-08-11.txt).
+Two MI350X (gfx950, 256 CU) machines appear below. **Host A** carried the 2026-07-29 and
+2026-08-11 runs, **host B** the 2026-08-18 re-measurement. They are distinguished only because
+mixing them inside one ratio would be dishonest.
+
+**`ours_*` re-measured 2026-08-18** on host B (device `0x75a0`), binaries built locally in
+`rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.13_pytorch_release_2.9.1` (HIP 7.0.51831 — same ROCm
+major/minor as the rows it replaces) and executed under a ROCm 7.2.3 container.
+`HIP_VISIBLE_DEVICES=0`, `rocm-smi --setperfdeterminism 2200`, median of 3 interleaved passes
+(arms alternate on every shape and every rep). Raw:
+[`prof_results/ab_pr7fix_vs_main_2026-08-18.tsv`](prof_results/ab_pr7fix_vs_main_2026-08-18.tsv).
+The pre-fix sweep that surfaced the `N=128` regression, and a 9-rep recheck of its marginal shapes,
+are in [`ab_pr7_vs_main_...`](prof_results/ab_pr7_vs_main_2026-08-18.tsv) and
+[`..._recheck9_...`](prof_results/ab_pr7_vs_main_recheck9_2026-08-18.tsv).
+
+**`ck_*` are NOT from that run.** They are carried over unchanged from the 2026-08-11 measurement on
+host A (image `rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0`, CK
+`tile_example_mx_flatmm -mx_prec=fp8xfp8 -v=0 -warmup=20 -repeat=50`, raw
+[`prof_results/bench_mi350x_2026-08-11.txt`](prof_results/bench_mi350x_2026-08-11.txt)).
+So `ours/CK` mixes two hosts and is indicative only. Host B measured slower than host A on shapes
+both have seen (N=105728 K=1024: 0.3333 ms against 0.2875 ms), so the mixed ratios more likely
+understate this library than flatter it; no correction has been applied. Same-machine CK for the
+shapes that support it is in the section below.
+
 K is zero-padded to a multiple of `K_TILE=192` inside the harness and TFLOPs are charged against the
 nominal K, so rows whose K is not a multiple of 32 (which `preprocess.hpp` requires of a real caller)
 are measured as their padded equivalent — the padding waste shows up as a lower `ours_TF`.
 
-| N | K | count | tile | S | ours_ms | ours_TF | ck_ms | ck_TF | ours/CK | source |
+| N | K | count | tile | S | ours_ms | ours_TF | ck_ms | ck_TF | ours/CK | vs main |
 |---:|---:|---:|:---:|:---:|---:|---:|---:|---:|:---:|:---|
-| 1 | 512 | 4 | — | — | 0.007884 | 0.3 | 0.004772 | 0.4 | 0.61× | not re-measured ‡ |
-| 128 | 24 | 2 | — | — | 0.005060 | 2.5 | 0.004634 | 2.7 | 0.92× | not re-measured ‡ |
-| 128 | 32 | 1 | — | — | 0.005066 | 3.3 | 0.004760 | 3.5 | 0.94× | not re-measured ‡ |
-| 128 | 64 | 1 | — | — | 0.005050 | 6.6 | 0.004740 | 7.1 | 0.94× | not re-measured ‡ |
-| 128 | 92 | 1 | — | — | 0.005034 | 9.6 | 0.004720 | 10.2 | 0.94× | not re-measured ‡ |
-| 128 | 96 | 1 | — | — | 0.005052 | 10.0 | 0.004746 | 10.6 | 0.94× | not re-measured ‡ |
-| 128 | 104 | 1 | — | — | 0.005072 | 10.8 | 0.004874 | 11.2 | 0.96× | not re-measured ‡ |
-| 128 | 152 | 1 | — | — | 0.005058 | 15.8 | 0.004746 | 16.8 | 0.94× | not re-measured ‡ |
-| 128 | 240 | 1 | — | — | 0.006800 | 18.5 | 0.004706 | 26.7 | 0.69× | not re-measured ‡ |
-| 128 | 520 | 1 | — | — | 0.007864 | 34.7 | 0.005254 | 51.9 | 0.67× | not re-measured ‡ |
-| 128 | 1840 | 1 | — | — | 0.016388 | 58.9 | 0.008052 | 119.8 | 0.49× | not re-measured ‡ |
-| 256 | 64 | 23 | 128x256 | 1 | 0.005196 | **12.9** | 0.004768 | 14.1 | **0.91×** | CK: 2026-06 † |
-| 256 | 80 | 22 | 128x256 | 1 | 0.005196 | **16.1** | 0.004794 | 17.5 | **0.92×** | CK: 2026-06 † |
-| 256 | 96 | 38 | 128x256 | 1 | 0.005202 | **19.4** | 0.004892 | 20.6 | **0.94×** | CK: 2026-06 † |
-| 256 | 128 | 21 | 128x256 | 1 | 0.005200 | **25.8** | 0.004789 | 28.0 | **0.92×** | CK: 2026-06 † |
-| 256 | 144 | 2 | 128x256 | 1 | 0.005202 | **29.0** | 0.004728 | 31.9 | **0.91×** | CK: 2026-06 † |
-| 256 | 160 | 2 | 128x256 | 1 | 0.005192 | **32.3** | 0.004788 | 35.0 | **0.92×** | CK: 2026-06 † |
-| 256 | 256 | 18 | 128x256 | 1 | 0.006444 | **41.7** | 0.004702 | 57.1 | **0.73×** | CK: 2026-06 † |
-| 256 | 512 | 1 | 128x256 | 1 | 0.007672 | **70.0** | 0.004768 | 112.6 | **0.62×** | CK: 2026-06 † |
-| 256 | 2048 | 6 | 128x256 | 1 | 0.017478 | **122.9** | 0.008366 | 256.7 | **0.48×** | CK: 2026-06 † |
-| 512 | 2560 | 8 | 128x256 | 1 | 0.021470 | **250.1** | 0.009712 | 552.8 | **0.45×** | CK: 2026-06 † |
-| 512 | 6144 | 4 | 128x256 | 4 | 0.023780 | **541.8** | 0.024172 | 533.0 | **1.02×** | CK: 2026-06 † |
-| 768 | 24 | 2 | 128x256 | 1 | 0.005474 | **13.8** | 0.004804 | 15.7 | **0.88×** | CK: 2026-06 † |
-| 768 | 32 | 1 | 128x256 | 1 | 0.005464 | **18.4** | 0.004862 | 20.7 | **0.89×** | CK: 2026-06 † |
-| 768 | 64 | 1 | 128x256 | 1 | 0.005466 | **36.8** | 0.004788 | 42.0 | **0.88×** | CK: 2026-06 † |
-| 768 | 92 | 1 | 128x256 | 1 | 0.005474 | **52.9** | 0.004930 | 58.7 | **0.90×** | CK: 2026-06 † |
-| 768 | 96 | 1 | 128x256 | 1 | 0.005472 | **55.2** | 0.004830 | 62.5 | **0.88×** | CK: 2026-06 † |
-| 768 | 104 | 1 | 128x256 | 1 | 0.005470 | **59.8** | 0.004838 | 67.6 | **0.88×** | CK: 2026-06 † |
-| 768 | 152 | 1 | 128x256 | 1 | 0.005468 | **87.4** | 0.004836 | 98.9 | **0.88×** | CK: 2026-06 † |
-| 768 | 240 | 1 | 128x256 | 1 | 0.006770 | **111.5** | 0.004908 | 153.8 | **0.72×** | CK: 2026-06 † |
-| 768 | 520 | 1 | 128x256 | 1 | 0.008008 | **204.3** | 0.005898 | 277.3 | **0.74×** | CK: 2026-06 † |
-| 768 | 1840 | 1 | 128x256 | 1 | 0.016878 | **342.9** | 0.008860 | 653.3 | **0.52×** | CK: 2026-06 † |
-| 1024 | 1024 | 10 | 128x256 | 1 | 0.011878 | **361.6** | 0.006670 | 643.9 | **0.56×** | CK: 2026-06 † |
-| 1024 | 3490 | 1 | 128x256 | 2 | 0.027186 | **538.4** | 0.016516 | 886.3 | **0.61×** | CK: 2026-06 † |
-| 1024 | 12288 | 20 | 128x256 | 4 | 0.042626 | **1209.1** | 0.047398 | 1087.4 | **1.11×** | CK: 2026-06 † |
-| 1024 | 16128 | 9 | 128x256 | 4 | 0.049618 | **1363.3** | 0.059578 | 1135.4 | **1.20×** | CK: 2026-06 † |
-| 1024 | 105728 | 1 | 128x256 | 4 | 0.273237 | **1623.0** | 0.486003 | 912.5 | **1.78×** | CK: 2026-06 † |
-| 2048 | 3490 | 1 | 128x256 | 2 | 0.033744 | **867.6** | 0.020896 | 1401.0 | **0.62×** | CK: 2026-06 † |
-| 3490 | 1024 | 1 | — | — | 0.014544 | 1006.5 | 0.016278 | 899.2 | 1.12× | not re-measured ‡ |
-| 4096 | 4096 | 20 | 128x256 | 1 | 0.041052 | **1674.0** | 0.048385 | 1464.6 | **1.14×** | CK: 2026-07-29 |
-| 6144 | 512 | 8 | 128x384 | 1 | 0.012954 | **994.7** | 0.028225 | 470.8 | **2.11×** | CK: 2026-07-29 |
-| 6144 | 4096 | 20 | 128x384 | 1 | 0.047232 | **2182.4** | 0.083084 | 1279.4 | **1.71×** | CK: 2026-07-29 |
-| 6144 | 16128 | 9 | 128x384 | 1 | 0.149118 | **2721.8** | 0.252273 | 1659.2 | **1.64×** | CK: 2026-07-29 |
-| 6144 | 105728 | 1 | 128x384 | 1 | 1.040697 | **2556.7** | 1.875560 | 1463.0 | **1.75×** | CK: 2026-07-29 |
-| 12672 | 1024 | 9 | — | — | 0.038762 | 1371.2 | 0.051960 | 1022.9 | 1.34× | not re-measured ‡ |
-| 16128 | 1024 | 9 | 256x256 | 1 | 0.040318 | **1677.8** | 0.067595 | 1032.0 | **1.63×** | CK: 2026-07-29 |
-| 16384 | 1024 | 10 | 256x256 | 1 | 0.043020 | **1597.4** | 0.068504 | 1034.5 | **1.54×** | CK: 2026-07-29 |
-| 20480 | 6144 | 9 | 256x256 | 1 | 0.212467 | **2425.8** | 0.272072 | 1953.5 | **1.24×** | CK: 2026-07-29 |
-| 102272 | 1024 | 1 | — | — | 0.311703 | 1376.2 | 0.472239 | 908.4 | 1.52× | not re-measured ‡ |
-| 105728 | 1024 | 1 | 256x256 | 1 | 0.293855 | **1509.1** | 0.490322 | 932.7 | **1.62×** | CK: 2026-07-29 |
+| 1 | 512 | 4 | — | — | 0.007884 | 0.3 ‡ | 0.004772 | 0.4 | — ‡ | — ‡ |
+| 128 | 24 | 2 | 128x128 | 1 | 0.003852 | **3.3** | 0.004634 | 2.7 | **1.21×** | 1.036× |
+| 128 | 32 | 1 | 128x128 | 1 | 0.003858 | **4.3** | 0.004760 | 3.5 | **1.24×** | 1.037× |
+| 128 | 64 | 1 | 128x128 | 1 | 0.003848 | **8.7** | 0.004740 | 7.1 | **1.23×** | 1.038× |
+| 128 | 92 | 1 | 128x128 | 1 | 0.003856 | **12.5** | 0.004720 | 10.2 | **1.23×** | 1.035× |
+| 128 | 96 | 1 | 128x128 | 1 | 0.003850 | **13.1** | 0.004746 | 10.6 | **1.23×** | 1.031× |
+| 128 | 104 | 1 | 128x128 | 1 | 0.003854 | **14.1** | 0.004874 | 11.2 | **1.26×** | 1.042× |
+| 128 | 152 | 1 | 128x128 | 1 | 0.003854 | **20.7** | 0.004746 | 16.8 | **1.23×** | 1.040× |
+| 128 | 240 | 1 | 128x128 | 1 | 0.004856 | **25.9** | 0.004706 | 26.7 | **0.97×** | 1.059× |
+| 128 | 520 | 1 | 128x128 | 1 | 0.005770 | **47.2** | 0.005254 | 51.9 | **0.91×** | 1.057× |
+| 128 | 1840 | 1 | 128x128 | 1 | 0.012318 | **78.3** | 0.008052 | 119.8 | **0.65×** | 1.031× |
+| 256 | 64 | 23 | 128x256 | 1 | 0.004934 | **13.6** | 0.004768 | 14.1 | **0.96×** | 1.060× |
+| 256 | 80 | 22 | 128x256 | 1 | 0.004934 | **17.0** | 0.004794 | 17.5 | **0.97×** | 1.059× |
+| 256 | 96 | 38 | 128x256 | 1 | 0.004922 | **20.5** | 0.004892 | 20.6 | **0.99×** | 1.063× |
+| 256 | 128 | 21 | 128x256 | 1 | 0.004934 | **27.2** | 0.004789 | 28.0 | **0.97×** | 1.059× |
+| 256 | 144 | 2 | 128x256 | 1 | 0.004936 | **30.6** | 0.004728 | 31.9 | **0.96×** | 1.060× |
+| 256 | 160 | 2 | 128x256 | 1 | 0.004914 | **34.1** | 0.004788 | 35.0 | **0.98×** | 1.063× |
+| 256 | 256 | 18 | 128x256 | 1 | 0.006228 | **43.1** | 0.004702 | 57.1 | **0.75×** | 1.090× |
+| 256 | 512 | 1 | 128x256 | 1 | 0.007386 | **72.7** | 0.004768 | 112.6 | **0.65×** | 1.076× |
+| 256 | 2048 | 6 | 128x256 | 1 | 0.017014 | **126.2** | 0.008366 | 256.7 | **0.49×** | 1.030× |
+| 512 | 2560 | 8 | 128x256 | 1 | 0.020724 | **259.1** | 0.009712 | 552.8 | **0.47×** | 1.028× |
+| 512 | 6144 | 4 | 128x256 | 4 | 0.023518 | **547.9** | 0.024172 | 533.0 | **1.03×** | 1.022× |
+| 768 | 24 | 2 | 128x256 | 1 | 0.005238 | **14.4** | 0.004804 | 15.7 | **0.92×** | 1.055× |
+| 768 | 32 | 1 | 128x256 | 1 | 0.005202 | **19.4** | 0.004862 | 20.7 | **0.93×** | 1.060× |
+| 768 | 64 | 1 | 128x256 | 1 | 0.005188 | **38.8** | 0.004788 | 42.0 | **0.92×** | 1.062× |
+| 768 | 92 | 1 | 128x256 | 1 | 0.005204 | **55.6** | 0.004930 | 58.7 | **0.95×** | 1.060× |
+| 768 | 96 | 1 | 128x256 | 1 | 0.005200 | **58.1** | 0.004830 | 62.5 | **0.93×** | 1.059× |
+| 768 | 104 | 1 | 128x256 | 1 | 0.005198 | **62.9** | 0.004838 | 67.6 | **0.93×** | 1.059× |
+| 768 | 152 | 1 | 128x256 | 1 | 0.005198 | **92.0** | 0.004836 | 98.9 | **0.93×** | 1.059× |
+| 768 | 240 | 1 | 128x256 | 1 | 0.006492 | **116.3** | 0.004908 | 153.8 | **0.76×** | 1.091× |
+| 768 | 520 | 1 | 128x256 | 1 | 0.007654 | **213.7** | 0.005898 | 277.3 | **0.77×** | 1.075× |
+| 768 | 1840 | 1 | 128x256 | 1 | 0.016166 | **358.0** | 0.008860 | 653.3 | **0.55×** | 1.036× |
+| 1024 | 1024 | 10 | 128x256 | 1 | 0.011444 | **375.3** | 0.006670 | 643.9 | **0.58×** | 1.052× |
+| 1024 | 3490 | 1 | 128x256 | 2 | 0.026714 | **548.0** | 0.016516 | 886.3 | **0.62×** | 1.019× |
+| 1024 | 12288 | 20 | 128x256 | 4 | 0.045550 | **1131.5** | 0.047398 | 1087.4 | **1.04×** | 1.000× |
+| 1024 | 16128 | 9 | 128x256 | 4 | 0.053524 | **1263.8** | 0.059578 | 1135.4 | **1.11×** | 0.984× |
+| 1024 | 105728 | 1 | 128x256 | 4 | 0.317142 | **1398.3** | 0.486003 | 912.5 | **1.53×** | 1.001× |
+| 2048 | 3490 | 1 | 128x256 | 2 | 0.035942 | **814.5** | 0.020896 | 1401.0 | **0.58×** | 1.001× |
+| 3490 | 1024 | 1 | 256x256 | 1 | 0.019642 | 745.2 ‡ | 0.016278 | 899.2 | — ‡ | — ‡ |
+| 4096 | 4096 | 20 | 128x256 | 1 | 0.041716 | **1647.3** | 0.048385 | 1464.6 | **1.12×** | 1.019× |
+| 6144 | 512 | 8 | 128x384 | 1 | 0.018736 | **687.7** | 0.028225 | 470.8 | **1.46×** | 0.896× |
+| 6144 | 4096 | 20 | 128x384 | 1 | 0.050602 | **2037.1** | 0.083084 | 1279.4 | **1.59×** | 1.148× |
+| 6144 | 16128 | 9 | 128x384 | 1 | 0.198743 | **2042.2** | 0.252273 | 1659.2 | **1.23×** | 1.047× |
+| 6144 | 105728 | 1 | 128x384 | 1 | 1.312899 | **2026.6** | 1.875560 | 1463.0 | **1.39×** | 1.443× |
+| 12672 | 1024 | 9 | 128x384 | 1 | 0.050774 | **1046.8** | 0.051960 | 1022.9 | **1.02×** | 1.061× |
+| 16128 | 1024 | 9 | 256x256 | 1 | 0.047862 | **1413.3** | 0.067595 | 1032.0 | **1.37×** | 1.154× |
+| 16384 | 1024 | 10 | 256x256 | 1 | 0.048384 | **1420.3** | 0.068504 | 1034.5 | **1.37×** | 1.117× |
+| 20480 | 6144 | 9 | 256x256 | 1 | 0.264430 | **1949.1** | 0.272072 | 1953.5 | **1.00×** | 1.047× |
+| 102272 | 1024 | 1 | 256x256 | 1 | 0.329811 | **1300.6** | 0.472239 | 908.4 | **1.43×** | 1.290× |
+| 105728 | 1024 | 1 | 256x256 | 1 | 0.332689 | **1332.9** | 0.490322 | 932.7 | **1.43×** | 1.141× |
 
-**`source`** dates the `ck` column. `ours` is 2026-08-11 on every row not marked ‡; CK has not
-been re-run since, so no row is same-session.
+No row is same-session across `ours` and `ck`: the `ck` column has not been re-run since 2026-08-11
+and comes from a different host. The `vs main` column is same-session by construction.
 
 † = **CK carried over from the 2026-06 harness**, so the ratio is *indicative*. The CK binary on
 this node (`tile_example_mx_flatmm`) exposes a single untuned kernel config, and at N ≤ 1024 it
@@ -80,20 +102,112 @@ lands at **0.33–0.54×** of the tuned 2026-06 numbers — publishing it here w
 margin by 2–3×, so the tuned figure is kept. CK also refuses `K % 256 != 0` outright (`KPerBlock`),
 which rules it out on most of the N=768 rows.
 
-‡ = **not re-measured — the kernel could not run these shapes when the table was taken.** The grid
-was `dim3(M/MT, N/NT)` with integer division and no remainder handling: for N=1 and N=128
-`floor(N/256)=0`, i.e. **zero workgroups launched** and the old row is timing an empty dispatch; for
-N=3490 / 12672 / 102272 only `floor(N/256)·256` columns were computed (162 / 128 / 128 short).
-Their numbers are left exactly as the old harness recorded them and must not be read as
-measurements of this library.
+‡ = **the harness cannot produce a valid number for this shape**, so its row is not a measurement of
+this library and its ratios are blanked.
 
-**Three of the five now run correctly**: N=128 and N=102272 route to 256×256 over a ceil grid with
-the last N-tile masked, and N=12672 (a multiple of 384) routes to 128×384. N=1 and N=3490 remain
-unsupported for a different reason — they are not multiples of 32, so the MX preprocessing rejects
-them before tiling is reached.
+- `N=1` — not a multiple of 32, so the MX preprocessing has no valid tiling. On `main` the grid is
+  `dim3(M/256, 0)`, i.e. zero workgroups, and the old row times an empty dispatch; on this branch the
+  ceil grid launches and the shape **faults** (`GPU coredump`). `ours_ms` is left at the old value.
+- `N=3490` — not a multiple of 128, so no implemented tile divides it and `choose_tile()` falls
+  through to its last-resort `256x256`. Measured `wg=104` = `8 x floor(3490/256)`, i.e. **3328 of
+  3490 columns computed, 162 never written**, on *both* arms. The latency is real but it is the
+  latency of 95% of the problem, charged against 100% of the FLOPs. Pre-existing; this branch neither
+  causes nor fixes it.
+
+**Three of the five shapes the old harness could not run now do**: `N=128` and `N=102272` route to
+256x256 over a ceil grid with the last N-tile masked, and `N=12672` (a multiple of 384) routes to
+128x384. All three carry real numbers above — `N=102272` gains 1.29x from it, `N=128` loses 2x
+(see the regression note under the table).
 
 Split-K rows are identified by `S > 1` in the table (`S` = number of K segments); their `ours_ms`
 includes the FP32 partial-sum reduce.
+
+### What the `vs main` column says (2026-08-18, 50 shapes, interleaved)
+
+48 rows carry a valid comparison: **42 disjoint wins, 0 disjoint losses, 6 overlapping (noise)**.
+The other 2 rows are the ‡ shapes, which the harness cannot measure at all. "Disjoint" means the two
+arms' min/max ranges do not overlap; overlapping differences are reported as noise regardless of how
+the medians fell.
+
+The first pass of this sweep found **10 disjoint losses, all of them `N=128`**, traced to the
+coverage-floor ordering and fixed before these numbers were taken — see below.
+
+**Wins.** Two route changes carry the large ones: `N=6144 K=105728` at **1.44×** (128x128 -> 128x384,
+the removed `LARGEK_THRESH` gate) and `N=102272 K=1024` at **1.29×** (128x128 -> 256x256 + masked
+last N-tile). Below those, `N=16128 K=1024` 1.15×, `N=6144 K=4096` 1.15×, `N=105728 K=1024` 1.14×,
+`N=16384 K=1024` 1.12×, `N=12672 K=1024` 1.06×. A broad **1.02–1.09×** covers most of the small-N 128x256 rows, consistent
+with the fp16 packed-convert epilogue and the one-shot accumulator init, both of which pay off most
+where the epilogue is a large share of a short kernel.
+
+**The `N=128` regression, found and fixed in this branch.** `main`'s floor ends at
+`(M%128)==0 && (N%128)==0 -> 128x128`; `ba01d19` inserted `(M%256)==0 && (N%128)==0 -> 256x256`
+above it, so `N=128` ran a 256-wide tile over a `ceil(N/256)=1` grid and masked half of it — 256
+columns computed for a 128-column problem, measured **0.49–0.54×** across all ten `N=128` rows.
+The same rule wins 1.29× on `N=102272`, where it wastes 0.1%.
+
+Any N reaching that arm is `N%256==128`, so the overshoot is always one 128-column half-tile and the
+waste is `128/N`; `N=128` is the only N with no full N-tile to amortize it. Fixed by adding
+`N >= 256` to the arm. Enumerated over M 128..8192 x N 128..131072 x two Kp: coverage unchanged
+(0 uncovered before and after) and `N=128` is the only N that re-routes. Those rows now measure
+**1.03–1.06× against `main`**, and `N=102272` still measures 1.29×. Three `check_routing()` cases
+pin it; removing the guard takes routing from 33/33 to 30/33.
+
+**`N=1 K=512` faults on this branch** (`GPU coredump`) where `main` returns without computing
+anything (zero-width grid). `N=1` is outside the contract — `preprocess.hpp` requires N%32==0 — so
+neither behaviour is correct. Row left at its old numbers and marked ‡.
+
+**`N=6144 K=512` is bimodal on this branch and unresolved.** Over 12 runs its median is 0.92× but its
+ranges overlap `main`'s, because 3 runs land at 0.0143–0.0157 ms (faster than `main`'s best of
+0.0153) and 9 land at 0.0176–0.0203. `main` is tight at 0.0153–0.0170 throughout. Both arms route to
+128x384, which is one of the two routes carrying the XCD grid swizzle. Flagged, not diagnosed.
+
+### Same-machine CK, 2026-08-18 (host B) — 18 of 50 shapes
+
+The table above pairs `ours` from host B with `ck` from host A. This section removes that mismatch
+for the shapes where it can. Raw:
+[`prof_results/ck_untuned_2026-08-18.tsv`](prof_results/ck_untuned_2026-08-18.tsv).
+
+Two limits, both measured rather than assumed:
+
+**CK ran 18 of the 50 shapes.** It rejects any shape with `N % 256 != 0` or `K % 256 != 0` outright,
+which removes every `N=128` and `N=768` row, all six short-K `N=256` rows, both `K=3490` rows, and
+`N=1 / 3490 / 12672 / 102272`.
+
+**The binary available to us is the untuned single-config build**, and this run confirms the `†`
+footnote's number rather than relying on it: against the tuned 2026-06 figures it lands at
+**0.33–0.54× for N ≤ 1024** — the footnote says 0.33–0.54× — and at **0.82–0.98× for N ≥ 4096**.
+So the small-N ratios below are inflated by roughly 2–3× and are shown only to document that; the
+`N ≥ 4096` block is the part worth reading, where the untuned penalty is comparable to the ~10%
+this host is slower overall.
+
+| N | K | ours_ms | ours_TF | ck_ms | ck_TF | ours/CK |
+|---:|---:|---:|---:|---:|---:|:---:|
+| 4096 | 4096 | 0.041716 | **1647.3** | 0.056032 | 1264.8 | **1.30×** |
+| 6144 | 512 | 0.018736 | **687.7** | 0.029423 | 451.6 | **1.52×** |
+| 6144 | 4096 | 0.050602 | **2037.1** | 0.093033 | 1142.6 | **1.78×** |
+| 6144 | 16128 | 0.198743 | **2042.2** | 0.282605 | 1481.1 | **1.38×** |
+| 6144 | 105728 | 1.312899 | **2026.6** | 1.929890 | 1421.8 | **1.43×** |
+| 16128 | 1024 | 0.047862 | **1413.3** | 0.076966 | 906.4 | **1.56×** |
+| 16384 | 1024 | 0.048384 | **1420.3** | 0.079608 | 890.2 | **1.60×** |
+| 20480 | 6144 | 0.264430 | **1949.1** | 0.333614 | 1593.2 | **1.22×** |
+| 105728 | 1024 | 0.332689 | **1332.9** | 0.497931 | 918.4 | **1.45×** |
+
+**Same host, same session: 1.22–1.78×, median 1.45×** across those 9 shapes. The mixed-host ratios
+in the main table give 1.36× median on the same 9.
+
+Small-N rows, **inflated — do not quote**:
+
+| N | K | ours_TF | ck_TF (untuned) | ratio |
+|---:|---:|---:|---:|:---:|
+| 256 | 256 | **43.2** | 20.0 | 2.17× |
+| 256 | 512 | **72.7** | 36.6 | 1.99× |
+| 256 | 2048 | **126.3** | 93.3 | 1.35× |
+| 512 | 2560 | **258.9** | 206.0 | 1.26× |
+| 512 | 6144 | **548.2** | 232.5 | 2.36× |
+| 1024 | 1024 | **374.8** | 231.8 | 1.62× |
+| 1024 | 12288 | **1145.1** | 533.7 | 2.15× |
+| 1024 | 16128 | **1270.4** | 545.3 | 2.33× |
+| 1024 | 105728 | **1398.4** | 492.4 | 2.84× |
 
 ---
 
@@ -222,8 +336,8 @@ when `k_tiles%S==0`). Verified vs CPU reference on the small uneven analog `2048
 The main table gives absolutes; this is the A/B that attributes them to the route change. The
 `128×256` baseline and the `128×384` build were compiled from the same source pair in one container
 invocation and run **interleaved, 3 reps**, with CK in the same session. M=2048, N=6144, FP16, on
-`bg-1w300-k2-3a`. Raw:
-[`prof_results/bench_mi350x_k2-3a_2026-07-29.txt`](prof_results/bench_mi350x_k2-3a_2026-07-29.txt).
+host A. Raw:
+[`prof_results/bench_mi350x_2026-07-29.txt`](prof_results/bench_mi350x_2026-07-29.txt).
 
 | K | baseline (128×256) | **128×384** | Δ | CK mxfp8 | baseline/CK | **new/CK** |
 |---:|---:|---:|:---:|---:|:---:|:---:|
@@ -263,9 +377,21 @@ proportionally more than the wave-quantization argument alone predicts.
    either, and the win was the dropped half-empty CU wave. Removing the K-gate on the wave-saving
    128×384 arm then took the same shape to **2557 TF (+44.7%)** with a 3× *larger* B slice.
    See `docs/OPTIMIZATIONS.md §9` and
-   [`prof_results/bench_mi350x_k2-3a_2026-08-11.txt`](prof_results/bench_mi350x_k2-3a_2026-08-11.txt).
+   [`prof_results/bench_mi350x_2026-08-11.txt`](prof_results/bench_mi350x_2026-08-11.txt).
 6. **Split-K's own ceiling** — the FP32 partial-sum write + reduce round-trip caps speedup well below the ideal `S×` (2.99× of an ideal 4× for 105728).
 7. ~~**Wide-N wave quantization**~~ — **RESOLVED.** `2048×6144×{512,4096,16128}` ran 384 WGs on
    256 CUs (1.5 waves). Routing `N%384==0` shapes to a **128×384 tile** gives exactly 256 WGs;
    +29%/+49%/+59% and 1.64–2.04× CK. The gate was later found to apply at large K too (item 5), so
    every N=6144 shape now takes this route.
+8. **`2048×6144×512` is the one open regression risk on this branch.** The 50-shape A/B reports it
+   as overlapping rather than a loss, but the margin is **0.22%**: `main` spans 0.015986–0.017128 ms
+   and this branch 0.017090–0.019114, so the ranges touch by 38 ns. Best-against-best is **0.935×**,
+   and over 12 runs the median is 0.92× with 3 runs beating `main`'s best and 9 clearly behind.
+   Calling it noise is a verdict the disjointness test barely licensed, not one the data supports.
+   Both arms route 128×384, one of the two routes carrying the XCD swizzle. Diagnosing it needs an
+   ATT capture, since the bimodality is the whole signal. **Not started.**
+9. **`N=1` faults on this branch** where `main` launched a zero-width grid and returned without
+   computing. `N=1` is outside the contract (`preprocess.hpp` requires `N%32==0`) so neither is
+   correct, but a GPU coredump is a worse failure mode than a silent no-op. A cheap fix is an early
+   return with a stderr warning for `N%32!=0`, matching what `gemm()` already does when the split-K
+   workspace is too small. **Not started, deliberately deferred.**
