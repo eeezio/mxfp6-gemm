@@ -65,6 +65,14 @@ size_t gemm_workspace_size(int M, int N, int Kp) {
     return detail::splitk_workspace_bytes(M, N, Kp);
 }
 
+// Pre-K_real entry point, kept so objects compiled against the older header still link. Same
+// behaviour as passing K_real=0: every sub-slab of the last tile runs, including the all-pad ones.
+void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, const uint8_t* dsA,
+          const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes, void* ws,
+          size_t ws_bytes) {
+    gemm(ot, M, N, Kp, dA, dBsh, dsA, dsB, dD, A_row_bytes, B_row_bytes, ws, ws_bytes, 0);
+}
+
 void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, const uint8_t* dsA,
           const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes, void* ws,
           size_t ws_bytes, int K_real) {

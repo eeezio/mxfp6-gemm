@@ -65,8 +65,18 @@ size_t gemm_workspace_size(int M, int N, int Kp);
 //     kernel skip the last tile's all-pad sub-slabs: 11% of the work at K=1024, worth +2.6%.
 //     A HINT, not a contract -- only the 256x256 route at very wide N acts on it, and a value
 //     that does not satisfy kpad(K_real) == Kp is dropped rather than trusted.
+//
+// K_real is a separate overload rather than a defaulted parameter: a default argument is a
+// source-level convenience the caller expands, so it would still have changed the mangled name of
+// the 13-argument entry point and broken the link for any object compiled against the older
+// header. Two overloads keep both symbols in the archive. Do not merge them back into one
+// declaration with `int K_real = 0` -- that reintroduces the ABI break, and the 13-argument call
+// becomes ambiguous if the wrapper is kept alongside it.
+void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, const uint8_t* dsA,
+          const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes, void* ws,
+          size_t ws_bytes);
 void gemm(OutType ot, int M, int N, int Kp, const void* dA, const void* dBsh, const uint8_t* dsA,
           const uint8_t* dsB, void* dD, int A_row_bytes, int B_row_bytes, void* ws, size_t ws_bytes,
-          int K_real = 0);
+          int K_real);
 
 }  // namespace mxfp6
